@@ -59,27 +59,37 @@ open-island-linux/
 
 | State | Window size | Trigger |
 |-------|------------|---------|
-| **Idle/collapsed** | 200×38px | No active sessions, no permission |
-| **Expanded** | 600×60px | User click, OR permission request |
+| **Sliver** | 200×38px (only 10px visible) | Idle, not hovered — pill pushed up via CSS transform |
+| **Expanded** | 600×60px | Hover OR permission request OR user click (pin) |
 | **Expanded + sessions** | 600×(60 + n×58)px | Active sessions visible |
 | **Expanded + permission** | 600×170px | Approval required |
 
-- Collapsed pill: dot + "Open Island" (11px) — nearly invisible when idle
-- Expanded pill: dot + brand + session chips (cwd paths) + chevron
+- **Sliver** (idle, not hovered): `.root` has `transform: translateY(-28px)`. Only the bottom 10px of the pill (the rounded corners) is visible below the KDE panel. Nearly invisible.
+- **Hover** → `isHovered = true` → `isExpanded = true` → full 600×60px expanded pill slides into view. 250ms debounce on mouse leave before collapsing back to sliver.
+- **Active sessions**: `isSliver` is false whenever `activeSessions.length > 0` — pill always visible.
+- **Permission**: auto-expands and stays expanded regardless of hover.
+- Expanded pill: dot + brand + session chips (cwd paths) + chevron/badge
 - Permission panel: tool name + args + Deny/Allow buttons
 - Session list: shown below pill when expanded and sessions active
-- Click toggles expanded (except when permission is pending — auto-expands)
-- Spring animation on height: `cubic-bezier(0.34, 1.56, 0.64, 1)` 0.32s
+- Click toggles `userExpanded` (pins expansion even after mouse leave)
+- Spring animation: `cubic-bezier(0.34, 1.56, 0.64, 1)` 0.32s on both height and transform
 - Content cross-fades between collapsed/expanded layers via opacity
 
 ## CSS constants (App.svelte)
 - `WIN_W = 600` — expanded window width (logical px)
-- `WIN_W_IDLE = 200` — collapsed window width (logical px)
+- `WIN_W_IDLE = 200` — collapsed/sliver window width (logical px)
 - `PILL_H = 60` — expanded pill height
-- `PILL_H_IDLE = 38` — collapsed pill height
+- `PILL_H_IDLE = 38` — collapsed/sliver window height (pill is 38px, only 10px visible in sliver)
 - `SESSION_H = 58` — per-session row height in list
 - `PERMISSION_H = 108` — permission panel height
+- `SLIVER_H = 10` — px of pill visible below KDE panel when idle
 - Font sizes: 11px collapsed brand, 12px expanded brand (intentionally below 13px)
+
+## Sliver hover mechanic (important)
+- `isSliver = $derived(!isHovered && !hasPermission && activeSessions.length === 0)`
+- `isExpanded = $derived(hasPermission || userExpanded || isHovered)`
+- Hover handlers are on `.hover-wrapper` (outer, no transform) NOT on `.root` (transformed). CSS transforms shift pointer-event hit areas — a `-28px` transform on `.root` would move its hover zone off-screen.
+- `.hover-wrapper` has no transform → its hit area is always the full window height → reliable mouseenter.
 
 ## Window / display
 - Window starts hidden, `"center": true` in tauri.conf.json for WM initial placement
@@ -115,8 +125,8 @@ Hook event names from Claude Code are PascalCase (`SessionStart`, not `sessionSt
 - Sessions appear correctly in the pill
 - Permission Allow/Deny flow works end-to-end
 - `dangerouslySkipPermissions: true` in `~/.claude/settings.json` prevents double-prompting
-- Pill collapses to small 200×38px capsule when idle, expands on click or permission
-- **Pending**: Confirm pill appears correctly positioned on eDP-1 primary monitor just below the 28px KDE panel after latest positioning fixes
+- Sliver mode: when idle, pill slides up so only bottom 10px visible. Hover → full 600×60px expansion. Mouse leave (250ms debounce) → back to sliver.
+- **Pending**: Confirm pill appears correctly positioned on eDP-1 primary monitor just below the 28px KDE panel
 
 ## Known issues / gotchas
 - `_NET_WORKAREA` returns y=0 on KDE Wayland + XWayland — useless for panel detection. Use `~/.config/plasmashellrc` `thickness=` instead.

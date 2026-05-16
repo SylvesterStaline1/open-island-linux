@@ -2,7 +2,6 @@
   import { onMount, onDestroy } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-  import { getCurrentWindow } from "@tauri-apps/api/window";
 
   type SessionPhase = "Idle" | "Working" | "AwaitingPermission" | "AwaitingQuestion" | "Completed";
 
@@ -32,15 +31,20 @@
   const SESSION_H = 58;
   const PERMISSION_H = 108;
   const MAX_H = 400;
+  const SLIVER_H = 10; // px visible at bottom when idle (rest hidden above screen top)
 
   let sessions: Session[] = $state([]);
   let permissionEvent: PermissionEvent | null = $state(null);
   let userExpanded = $state(false);
+  let isHovered = $state(false);
+  let hoverTimeout: ReturnType<typeof setTimeout> | null = null;
   let unlisteners: UnlistenFn[] = [];
 
   const activeSessions = $derived(sessions.filter(s => s.phase !== "Completed"));
   const hasPermission = $derived(permissionEvent !== null);
-  const isExpanded = $derived(hasPermission || userExpanded);
+  const isExpanded = $derived(hasPermission || userExpanded || isHovered);
+  // Sliver: idle + not hovered → pill hides above screen, only bottom SLIVER_H px visible
+  const isSliver = $derived(!isHovered && !hasPermission && activeSessions.length === 0);
 
   // Dot color reflects current status
   const dotColor = $derived(
@@ -60,9 +64,9 @@
   // Drive window size + centering together
   $effect(() => {
     const width  = isExpanded ? WIN_W : WIN_W_IDLE;
-    const pillH  = isExpanded ? PILL_H : PILL_H_IDLE;
     const sessH  = isExpanded ? Math.min(activeSessions.length, 4) * SESSION_H : 0;
     const permH  = hasPermission ? PERMISSION_H : 0;
+    const pillH  = isExpanded ? PILL_H : PILL_H_IDLE;
     const height = Math.min(pillH + sessH + permH, MAX_H);
     invoke("set_window_geometry", { width, height }).catch(() => {});
   });
@@ -77,7 +81,19 @@
     );
   });
 
-  onDestroy(() => unlisteners.forEach(u => u()));
+  onDestroy(() => {
+    unlisteners.forEach(u => u());
+    if (hoverTimeout !== null) clearTimeout(hoverTimeout);
+  });
+
+  function handleMouseEnter() {
+    if (hoverTimeout !== null) { clearTimeout(hoverTimeout); hoverTimeout = null; }
+    isHovered = true;
+  }
+
+  function handleMouseLeave() {
+    hoverTimeout = setTimeout(() => { isHovered = false; hoverTimeout = null; }, 250);
+  }
 
   function handlePillClick() {
     if (!hasPermission) userExpanded = !userExpanded;
@@ -114,7 +130,8 @@
   }
 </script>
 
-<div class="root">
+<div class="hover-wrapper" onmouseenter={handleMouseEnter} onmouseleave={handleMouseLeave}>
+<div class="root" class:sliver={isSliver}>
   <!-- Pill -->
   <div
     class="pill"
@@ -210,6 +227,7 @@
     </div>
   {/if}
 </div>
+</div>
 
 <style>
   :global(*) { box-sizing: border-box; margin: 0; padding: 0; }
@@ -221,12 +239,24 @@
     -webkit-user-select: none;
   }
 
+  /* Untransformed outer wrapper — preserves full hit area for hover detection */
+  .hover-wrapper {
+    width: 100%;
+  }
+
   .root {
     width: 100%;
     overflow: hidden;
     display: flex;
     flex-direction: column;
     gap: 3px;
+    transform: translateY(0);
+    transition: transform 0.32s cubic-bezier(0.34, 1.56, 0.64, 1);
+  }
+
+  /* Idle: push pill up so only bottom SLIVER_H (10px) peeks below the KDE panel */
+  .root.sliver {
+    transform: translateY(-28px); /* PILL_H_IDLE(38) - SLIVER_H(10) = 28 */
   }
 
   /* ── Pill ── */
