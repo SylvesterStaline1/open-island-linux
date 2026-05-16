@@ -18,10 +18,7 @@ The hooks binary is a separate crate:
 cargo build -p open-island-hook   # rebuilds just the hook relay
 ```
 
-After building, install Claude hooks via the system tray → "Install Claude Hooks", or:
-```bash
-# tray menu is the preferred way; hooks write to ~/.claude/settings.json
-```
+After building, install Claude hooks via the system tray → "Install Claude Hooks".
 
 ## Architecture
 
@@ -58,12 +55,46 @@ open-island-linux/
 ## Tools that block for approval (`requires_approval`)
 `Bash`, `Edit`, `Write`, `MultiEdit`, `NotebookEdit`, `WebFetch`, `WebSearch`, `computer_use`
 
+## Pill UI states
+
+| State | Window size | Trigger |
+|-------|------------|---------|
+| **Idle/collapsed** | 200×38px | No active sessions, no permission |
+| **Expanded** | 600×60px | User click, OR permission request |
+| **Expanded + sessions** | 600×(60 + n×58)px | Active sessions visible |
+| **Expanded + permission** | 600×170px | Approval required |
+
+- Collapsed pill: dot + "Open Island" (11px) — nearly invisible when idle
+- Expanded pill: dot + brand + session chips (cwd paths) + chevron
+- Permission panel: tool name + args + Deny/Allow buttons
+- Session list: shown below pill when expanded and sessions active
+- Click toggles expanded (except when permission is pending — auto-expands)
+- Spring animation on height: `cubic-bezier(0.34, 1.56, 0.64, 1)` 0.32s
+- Content cross-fades between collapsed/expanded layers via opacity
+
+## CSS constants (App.svelte)
+- `WIN_W = 600` — expanded window width (logical px)
+- `WIN_W_IDLE = 200` — collapsed window width (logical px)
+- `PILL_H = 60` — expanded pill height
+- `PILL_H_IDLE = 38` — collapsed pill height
+- `SESSION_H = 58` — per-session row height in list
+- `PERMISSION_H = 108` — permission panel height
+- Font sizes: 11px collapsed brand, 12px expanded brand (intentionally below 13px)
+
 ## Window / display
-- Window: 460px logical width, `decorations: false`, `transparent: true`, `alwaysOnTop: true`, `skipTaskbar: true`
-- **KDE Wayland fix**: `GDK_BACKEND=x11` in `main.rs` forces XWayland so GTK honours `set_position`
-- Positioning: `position_at_top()` in lib.rs uses `primary_monitor()` (not `current_monitor()` — that returns None before window is mapped). A 150ms delayed re-position fires after startup as belt-and-suspenders.
-- Dynamic height: `set_window_height` Tauri command called from `$effect` in App.svelte. **Must use `LogicalSize`** — using `PhysicalSize(460, h)` halves the visible width on HiDPI displays (2x scale).
-- Frontend also re-positions in `onMount` via JS `getCurrentWindow().currentMonitor()` with `availableMonitors()` fallback.
+- Window starts hidden, `"center": true` in tauri.conf.json for WM initial placement
+- **Key Tauri command**: `set_window_geometry(width, height)` — resizes AND recenters in one call. Called from `$effect` whenever `isExpanded` or session count changes. Does an immediate set_position + 80ms delayed retry.
+- **`primary_top_center(win, width)`** in lib.rs: computes (x, y) centered on the primary monitor, y = monitor_top + KDE panel height
+- **Panel height**: read from `~/.config/plasmashellrc` → `thickness=28`. `_NET_WORKAREA` does NOT work on this KDE Wayland + XWayland setup.
+- **KDE Wayland fix**: `GDK_BACKEND=x11` in `main.rs` forces XWayland so GTK honours `set_position`. Never remove this.
+- Always use `LogicalSize` / `LogicalPosition` — never PhysicalSize for window dimensions.
+- JS positioning removed from `onMount` — Rust is the single source of truth for window placement.
+- Startup sequence: `position_at_top` before `win.show()`, then 300ms delayed retry.
+
+## Multi-monitor setup (this machine)
+- External DP-2: 2496×1404 at global y=0 (top screen, NOT primary)
+- Laptop eDP-1: 1920×1200 at global y=1404 (PRIMARY — where pill lives)
+- `primary_monitor()` correctly returns eDP-1. Do NOT use "topmost by y" heuristic — that's the external monitor which the user does NOT want.
 
 ## Hook format in ~/.claude/settings.json
 Claude Code expects:
@@ -80,19 +111,23 @@ Claude Code expects:
 The `matcher` wrapper is required — bare `{ "type": "command" }` objects are silently ignored.
 Hook event names from Claude Code are PascalCase (`SessionStart`, not `sessionStart`). The server lowercases before matching.
 
-## Current state (as of 2026-05-15)
+## Current state (as of 2026-05-16)
 - Sessions appear correctly in the pill
 - Permission Allow/Deny flow works end-to-end
-- `dangerouslySkipPermissions: true` in `~/.claude/settings.json` prevents double-prompting from Claude's own dialog
-- **Pending**: Window centering + full-width rendering on HiDPI displays (the LogicalSize + primary_monitor fixes are in but need a fresh `cargo tauri dev` build to confirm)
+- `dangerouslySkipPermissions: true` in `~/.claude/settings.json` prevents double-prompting
+- Pill collapses to small 200×38px capsule when idle, expands on click or permission
+- **Pending**: Confirm pill appears correctly positioned on eDP-1 primary monitor just below the 28px KDE panel after latest positioning fixes
 
 ## Known issues / gotchas
-- `current_monitor()` returns None when called before the WM maps the window — use `primary_monitor()` instead
-- `set_size(PhysicalSize(460, h))` on a 2x display creates a 230-logical-pixel window, clipping the right half of the pill — always use `LogicalSize`
-- Terminal may be left in raw mode after a Tauri panic — run `reset` to fix
-- VS Code Up-arrow history: `"terminal.integrated.suggest.enabled": false` in settings.json
+- `_NET_WORKAREA` returns y=0 on KDE Wayland + XWayland — useless for panel detection. Use `~/.config/plasmashellrc` `thickness=` instead.
+- `current_monitor()` returns None when called before the WM maps the window — use `primary_monitor()` instead.
+- `set_size(PhysicalSize(w, h))` on a 2x display creates a half-logical-pixel window — always use `LogicalSize`.
+- Terminal may be left in raw mode after a Tauri panic — run `reset` to fix.
+- The user has two monitors: external DP-2 (top, NOT primary) and laptop eDP-1 (bottom, PRIMARY). The pill goes on eDP-1. Do NOT switch to a "topmost monitor" heuristic.
+- `set_window_geometry` spawns a delayed 80ms repositioning task — do not call it in a tight loop.
 
 ## Svelte 5 notes
 - Uses rune API: `$state`, `$derived`, `$effect`
 - `mount()` from `svelte` (not `new App()`) — vite.config.ts has `resolve: { conditions: ["browser", ...] }`
 - `$effect` runs before `onMount` in the first render cycle
+- Effects CAN set `$state` variables (e.g. auto-expanding on permission) without loops if the state change doesn't re-trigger the effect's dependencies
