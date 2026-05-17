@@ -5,13 +5,19 @@
 
   type SessionPhase = "Idle" | "Working" | "AwaitingPermission" | "AwaitingQuestion" | "Completed";
 
+  interface PendingPermission {
+    tool_name: string;
+    tool_input: unknown;
+  }
+
   interface Session {
     session_id: string;
     title: string | null;
     cwd: string | null;
     phase: SessionPhase;
     summary: string | null;
-    pending_permission: { tool_name: string; tool_input: unknown } | null;
+    pending_permission: PendingPermission | null;
+    pending_question: string | null;
     started_at: number;
     updated_at: number;
   }
@@ -22,88 +28,139 @@
     toolInput: unknown;
   }
 
-  // Window sizes (logical px)
-  const WIN_W = 600;
-  const WIN_W_IDLE = 200;
-  // Pill heights
-  const PILL_H = 60;
-  const PILL_H_IDLE = 38;
-  const SESSION_H = 58;
-  const PERMISSION_H = 108;
-  const MAX_H = 400;
-  const SLIVER_H = 10; // px visible at bottom when idle (rest hidden above screen top)
+  // ── Layout constants ─────────────────────────────────────────────────────
+  const WIN_W         = 480;
+  const PILL_H        = 44;
+  const SLIVER_OFFSET = 30;   // translateY(-30) → 14px peeks below KDE panel
+  const PANEL_GAP     = 8;    // gap between pill bottom and panel top
 
+  // ── State ────────────────────────────────────────────────────────────────
   let sessions: Session[] = $state([]);
   let permissionEvent: PermissionEvent | null = $state(null);
   let userExpanded = $state(false);
   let isHovered = $state(false);
-  let hoverTimeout: ReturnType<typeof setTimeout> | null = null;
+  let hoverLeaveTimer: ReturnType<typeof setTimeout> | null = null;
+  let panelEl: HTMLDivElement | null = $state(null);
+  let panelHeight = $state(0);
+  let appliedHeight = $state(PILL_H);
   let unlisteners: UnlistenFn[] = [];
 
   const activeSessions = $derived(sessions.filter(s => s.phase !== "Completed"));
-  const hasPermission = $derived(permissionEvent !== null);
-  const isExpanded = $derived(hasPermission || userExpanded || isHovered);
-  // Sliver: idle + not hovered → pill hides above screen, only bottom SLIVER_H px visible
-  const isSliver = $derived(!isHovered && !hasPermission && activeSessions.length === 0);
 
-  // Dot color reflects current status
-  const dotColor = $derived(
-    hasPermission                                                          ? "#f5a623" :
-    activeSessions.some(s => s.phase === "Working")                       ? "#7c6af7" :
-    activeSessions.some(s => s.phase === "AwaitingPermission")            ? "#f5a623" :
-    activeSessions.length > 0                                             ? "#5040a0" :
-                                                                            "#1e1e30"
+  const urgentSession = $derived(
+    activeSessions.find(s => s.pending_permission) ??
+    activeSessions.find(s => s.pending_question) ?? null
   );
-  const isPulsing = $derived(activeSessions.length > 0 || hasPermission);
 
-  // Auto-expand when permission arrives
+  const panelVariant = $derived(
+    urgentSession?.pending_permission ? "code"
+    : urgentSession?.pending_question ? "question"
+    : "list"
+  );
+
+  const isAwaiting = $derived(urgentSession !== null);
+
+  // Pill rests at sliver whenever no urgent session, even with active sessions
+  const isSliver = $derived(!isHovered && !userExpanded && !isAwaiting);
+
+  // Auto-open panel when urgent
+  $effect(() => { if (isAwaiting) userExpanded = true; });
+
+  // Up to 3 tool names for pill badges: urgent first, then working sessions
+  const pillTopTools = $derived((() => {
+    const tools: string[] = [];
+    if (urgentSession?.pending_permission) {
+      tools.push(urgentSession.pending_permission.tool_name);
+    } else if (urgentSession?.pending_question) {
+      tools.push("question");
+    }
+    for (const s of activeSessions) {
+      if (tools.length >= 3) break;
+      if (s === urgentSession) continue;
+      tools.push(currentToolOf(s));
+    }
+    if (tools.length === 0) tools.push("power");
+    return tools.slice(0, 3);
+  })());
+
+  // ── Hover handlers ───────────────────────────────────────────────────────
+  function handleMouseEnter() {
+    if (hoverLeaveTimer) { clearTimeout(hoverLeaveTimer); hoverLeaveTimer = null; }
+    isHovered = true;
+  }
+  function handleMouseLeave() {
+    hoverLeaveTimer = setTimeout(() => { isHovered = false; hoverLeaveTimer = null; }, 250);
+  }
+
+  // ── ResizeObserver: measure rendered panel height ────────────────────────
   $effect(() => {
-    if (hasPermission) userExpanded = true;
+    if (!panelEl) return;
+    const ro = new ResizeObserver(entries => {
+      const h = Math.ceil(entries[0].contentRect.height);
+      panelHeight = Math.ceil(h / 4) * 4; // snap to 4px to suppress 1px churn
+    });
+    ro.observe(panelEl);
+    return () => ro.disconnect();
   });
 
-  // Drive window size + centering together
+  // ── Window geometry: grow fast, shrink after close animation ────────────
   $effect(() => {
-    const width  = isExpanded ? WIN_W : WIN_W_IDLE;
-    const sessH  = isExpanded ? Math.min(activeSessions.length, 4) * SESSION_H : 0;
-    const permH  = hasPermission ? PERMISSION_H : 0;
-    const pillH  = isExpanded ? PILL_H : PILL_H_IDLE;
-    const height = Math.min(pillH + sessH + permH, MAX_H);
-    invoke("set_window_geometry", { width, height }).catch(() => {});
+    const target = PILL_H + (userExpanded ? PANEL_GAP + panelHeight : 0);
+    if (target >= appliedHeight) {
+      appliedHeight = target;
+      invoke("set_window_geometry", { width: WIN_W, height: target }).catch(() => {});
+    } else {
+      const id = setTimeout(() => {
+        appliedHeight = target;
+        invoke("set_window_geometry", { width: WIN_W, height: target }).catch(() => {});
+      }, 470);
+      return () => clearTimeout(id);
+    }
   });
 
+  // ── Mount / destroy ──────────────────────────────────────────────────────
   onMount(async () => {
     sessions = await invoke<Session[]>("get_sessions").catch(() => []);
-
     unlisteners.push(
-      await listen<Session[]>("sessions-changed", (e) => { sessions = e.payload; }),
-      await listen<PermissionEvent>("permission-requested", (e) => { permissionEvent = e.payload; }),
-      await listen<string>("permission-resolved", () => { permissionEvent = null; }),
+      await listen<Session[]>("sessions-changed", (e) => {
+        sessions = e.payload;
+        if (permissionEvent) {
+          const owner = sessions.find(s => s.session_id === permissionEvent!.sessionId);
+          if (!owner || !owner.pending_permission) {
+            permissionEvent = null;
+          }
+        }
+      }),
+      await listen<PermissionEvent>("permission-requested", (e) => {
+        permissionEvent = e.payload;
+      }),
+      await listen<string>("permission-resolved", () => {
+        permissionEvent = null;
+      }),
+      await listen("tauri://blur", () => {
+        if (!isAwaiting) userExpanded = false;
+      }),
     );
   });
 
-  onDestroy(() => {
-    unlisteners.forEach(u => u());
-    if (hoverTimeout !== null) clearTimeout(hoverTimeout);
-  });
-
-  function handleMouseEnter() {
-    if (hoverTimeout !== null) { clearTimeout(hoverTimeout); hoverTimeout = null; }
-    isHovered = true;
-  }
-
-  function handleMouseLeave() {
-    hoverTimeout = setTimeout(() => { isHovered = false; hoverTimeout = null; }, 250);
-  }
+  onDestroy(() => unlisteners.forEach(u => u()));
 
   function handlePillClick() {
-    if (!hasPermission) userExpanded = !userExpanded;
+    if (!isAwaiting) userExpanded = !userExpanded;
   }
 
-  async function handlePermission(allow: boolean) {
-    if (!permissionEvent) return;
-    const id = permissionEvent.sessionId;
-    permissionEvent = null;
-    await invoke("resolve_permission", { sessionId: id, allow }).catch(console.error);
+  async function focusSession(sessionId: string) {
+    await invoke("focus_session_terminal", { sessionId }).catch(() => {});
+  }
+
+  // ── Helpers ──────────────────────────────────────────────────────────────
+  function currentToolOf(s: Session): string {
+    if (s.pending_permission) return s.pending_permission.tool_name;
+    if (s.summary) {
+      const m = s.summary.match(/^Running (\w+)$/);
+      if (m) return m[1];
+    }
+    return "bash";
   }
 
   function shortCwd(cwd: string | null): string {
@@ -112,124 +169,415 @@
     return parts.slice(-2).join("/") || "~";
   }
 
-  function phaseColor(phase: SessionPhase): string {
-    switch (phase) {
-      case "Working":            return "#7c6af7";
-      case "AwaitingPermission": return "#f5a623";
-      case "Completed":          return "#4caf50";
-      default:                   return "#44445a";
+  function shortPath(p: string | null | undefined): string {
+    if (!p) return "";
+    const parts = (p as string).replace(/^\/home\/[^/]+/, "~").split("/");
+    return parts.slice(-2).join("/") || p;
+  }
+
+  function truncate(s: string, n: number): string {
+    return s.length > n ? s.slice(0, n - 1) + "…" : s;
+  }
+
+  function relTime(startedAt: number): string {
+    const secs = Math.max(0, Math.floor(Date.now() / 1000 - startedAt));
+    if (secs < 60) return `${secs}s`;
+    const mins = Math.floor(secs / 60);
+    if (mins < 60) return `${mins}m`;
+    return `${Math.floor(mins / 60)}h`;
+  }
+
+  // ── Tool glyph maps ──────────────────────────────────────────────────────
+  const TOOL_GLYPHS: Record<string, string> = {
+    bash:
+      "............" + "............" + "..#........." + "..##........" +
+      "..###......." + "..####......" + "..###......." + "..##........" +
+      "..#........." + "............" + ".....#####.." + "............",
+    edit:
+      "............" + "............" + ".........##." + "........###." +
+      ".......###.." + "......###..." + ".....###...." + "....###....." +
+      "...###......" + "..###......." + ".##........." + ".#..........",
+    write:
+      "............" + "..#######..." + "..#.....#..." + "..#.###.#..." +
+      "..#.....#..." + "..#.###.#..." + "..#.....#..." + "..#.###.#..." +
+      "..#.....#..." + "..#.....#..." + "..#######..." + "............",
+    multiedit:
+      "............" + "..######...." + "..#....#...." + "..#.######.." +
+      "..######.#.." + ".......#.#.." + ".......#.#.." + ".......#.#.." +
+      ".......#.#.." + ".......#.#.." + ".......###.." + "............",
+    notebook:
+      "............" + ".##########." + ".##.......#." + ".##.#####.#." +
+      ".##.......#." + ".##.#####.#." + ".##.......#." + ".##.#####.#." +
+      ".##.......#." + ".##.#####.#." + ".##########." + "............",
+    webfetch:
+      "............" + "....####...." + "..##.##.##.." + ".#..#.##..#." +
+      ".#..#.##..#." + ".########.#." + ".########.#." + ".#..#.##..#." +
+      ".#..#.##..#." + "..##.##.##.." + "....####...." + "............",
+    websearch:
+      "............" + "..####......" + ".##..##....." + ".#....#....." +
+      ".#....#....." + ".#....#....." + ".##..##....." + "..####......" +
+      "......##...." + ".......##..." + "........##.." + ".........#..",
+    read:
+      "............" + "............" + "....####...." + "..##....##.." +
+      ".#..####..#." + ".#.######.#." + ".#.######.#." + ".#..####..#." +
+      "..##....##.." + "....####...." + "............" + "............",
+    check:
+      "............" + "............" + "............" + "..........#." +
+      ".........##." + ".#......##.." + ".##....##..." + "..##..##...." +
+      "...####....." + "....##......" + "............" + "............",
+    alert:
+      "............" + ".....##....." + "....####...." + "....####...." +
+      "...##..##..." + "...##..##..." + "..##.##.##.." + "..##.##.##.." +
+      ".##..##..##." + ".###########" + ".###########" + "............",
+    power:
+      "............" + "......#....." + "......#....." + "...#..#..#.." +
+      ".##.......##" + ".#.........#" + ".#.........#" + ".#.........#" +
+      ".##.......##" + "...##...##.." + ".....###...." + "............",
+    chevronDown:
+      "............" + "............" + "............" + ".#........#." +
+      ".##......##." + "..##....##.." + "...##..##..." + "....####...." +
+      ".....##....." + "............" + "............" + "............",
+    chevronUp:
+      "............" + "............" + ".....##....." + "....####...." +
+      "...##..##..." + "..##....##.." + ".##......##." + ".#........#." +
+      "............" + "............" + "............" + "............",
+    close:
+      "............" + ".##......##." + ".###....###." + "..###..###.." +
+      "...######..." + "....####...." + "....####...." + "...######..." +
+      "..###..###.." + ".###....###." + ".##......##." + "............",
+    play:
+      "............" + "...##......." + "...####....." + "...######..." +
+      "...########." + "...#########" + "...#########" + "...########." +
+      "...######..." + "...####....." + "...##......." + "............",
+    question:
+      "............" + "....####...." + "...##..##..." + "..##....##.." +
+      "..##....##.." + "........##.." + ".......##..." + "......##...." +
+      "......##...." + "............" + "......##...." + "............",
+  };
+
+  const TOOL_GLYPH_MAP: Record<string, string> = {
+    Bash: "bash", Edit: "edit", Write: "write", MultiEdit: "multiedit",
+    NotebookEdit: "notebook", WebFetch: "webfetch", WebSearch: "websearch",
+    Read: "read", question: "question",
+  };
+
+  const TOOL_LABEL: Record<string, string> = {
+    Bash: "BASH", Edit: "EDIT", Write: "WRITE", MultiEdit: "MULTIEDIT",
+    NotebookEdit: "NOTEBOOK", WebFetch: "WEB FETCH", WebSearch: "WEB SEARCH",
+    Read: "READ",
+  };
+
+  function dotGlyph(key: string, size: number = 16, color: string = "currentColor"): string {
+    const src = TOOL_GLYPHS[key] ?? "";
+    if (src.length !== 144) return `<svg viewBox="0 0 120 120" width="${size}" height="${size}" aria-hidden="true"></svg>`;
+    const cell = 10, r = (cell * 0.65) / 2, vw = 12 * cell;
+    const circles: string[] = [];
+    for (let y = 0; y < 12; y++)
+      for (let x = 0; x < 12; x++)
+        if (src[y * 12 + x] === "#")
+          circles.push(`<circle cx="${x * cell + cell / 2}" cy="${y * cell + cell / 2}" r="${r}" fill="${color}"/>`);
+    return `<svg viewBox="0 0 ${vw} ${vw}" width="${size}" height="${size}" style="display:block;flex-shrink:0" aria-hidden="true">${circles.join("")}</svg>`;
+  }
+
+  // ── Diff builder ─────────────────────────────────────────────────────────
+  interface DiffRow { num: string | number; type: "ctx" | "add" | "del"; text: string }
+  interface DiffResult { lines: DiffRow[]; added: number; removed: number; path: string; title: string }
+
+  function buildDiff(p: PendingPermission): DiffResult {
+    const inp = (p.tool_input ?? {}) as Record<string, unknown>;
+    switch (p.tool_name) {
+      case "Edit": {
+        const oldLines = String(inp.old_string ?? "").split("\n");
+        const newLines = String(inp.new_string ?? "").split("\n");
+        const rows: DiffRow[] = [
+          ...oldLines.map((l, i) => ({ num: i + 1, type: "del" as const, text: truncate(l, 60) })),
+          ...newLines.map((l, i) => ({ num: i + 1, type: "add" as const, text: truncate(l, 60) })),
+        ];
+        return { lines: rows.slice(0, 8), added: newLines.length, removed: oldLines.length,
+                 path: shortPath(inp.file_path as string), title: `Edit ${shortPath(inp.file_path as string)}` };
+      }
+      case "MultiEdit": {
+        const edits = (inp.edits as Record<string, unknown>[] | undefined)?.[0] ?? {};
+        const oldLines = String((edits as Record<string,unknown>).old_string ?? "").split("\n");
+        const newLines = String((edits as Record<string,unknown>).new_string ?? "").split("\n");
+        const rows: DiffRow[] = [
+          ...oldLines.map((l, i) => ({ num: i + 1, type: "del" as const, text: truncate(l, 60) })),
+          ...newLines.map((l, i) => ({ num: i + 1, type: "add" as const, text: truncate(l, 60) })),
+        ];
+        const fp = ((edits as Record<string,unknown>).file_path as string) ?? inp.file_path as string ?? "";
+        return { lines: rows.slice(0, 8), added: newLines.length, removed: oldLines.length,
+                 path: shortPath(fp), title: `MultiEdit ${shortPath(fp)}` };
+      }
+      case "Write": {
+        const lines = String(inp.content ?? "").split("\n").slice(0, 6)
+          .map((l, i) => ({ num: i + 1, type: "add" as const, text: truncate(l, 60) }));
+        return { lines, added: String(inp.content ?? "").split("\n").length, removed: 0,
+                 path: shortPath(inp.file_path as string), title: `Write ${shortPath(inp.file_path as string)}` };
+      }
+      case "NotebookEdit": {
+        const lines = String(inp.new_source ?? "").split("\n").slice(0, 6)
+          .map((l, i) => ({ num: i + 1, type: "add" as const, text: truncate(l, 60) }));
+        return { lines, added: String(inp.new_source ?? "").split("\n").length, removed: 0,
+                 path: shortPath(inp.notebook_path as string), title: `Notebook ${shortPath(inp.notebook_path as string)}` };
+      }
+      case "Bash":
+        return { lines: [{ num: " ", type: "ctx", text: truncate(`$ ${inp.command ?? ""}`, 80) }],
+                 added: 0, removed: 0, path: "BASH", title: "Run command" };
+      case "WebFetch":
+        return { lines: [{ num: " ", type: "ctx", text: truncate(String(inp.url ?? ""), 80) }],
+                 added: 0, removed: 0, path: "WEB FETCH", title: "Fetch URL" };
+      case "WebSearch":
+        return { lines: [{ num: " ", type: "ctx", text: truncate(String(inp.query ?? ""), 80) }],
+                 added: 0, removed: 0, path: "WEB SEARCH", title: "Web search" };
+      default: {
+        const j = truncate(JSON.stringify(inp), 100);
+        return { lines: [{ num: " ", type: "ctx", text: j }],
+                 added: 0, removed: 0, path: p.tool_name.toUpperCase(), title: p.tool_name };
+      }
     }
   }
 
-  function formatInput(input: unknown): string {
-    if (!input) return "";
-    try {
-      const s = JSON.stringify(input);
-      return s.length > 120 ? s.slice(0, 120) + "…" : s;
-    } catch { return ""; }
+  function parseQuestion(q: string): { question: string; options: string[] } {
+    // Future: parse structured format. For v1, treat the whole string as the question.
+    return { question: q, options: [] };
+  }
+
+  function otherSessions(exclude: Session): Session[] {
+    return activeSessions.filter(s => s.session_id !== exclude.session_id);
   }
 </script>
 
-<div class="hover-wrapper" onmouseenter={handleMouseEnter} onmouseleave={handleMouseLeave}>
+<!-- Hover wrapper: no transform — reliable hit area for sliver hover -->
+<div
+  class="hover-wrapper"
+  onmouseenter={handleMouseEnter}
+  onmouseleave={handleMouseLeave}
+  role="presentation"
+>
 <div class="root" class:sliver={isSliver}>
-  <!-- Pill -->
-  <div
-    class="pill"
-    class:expanded={isExpanded}
-    role="button"
-    tabindex="0"
-    onclick={handlePillClick}
-    onkeydown={(e) => e.key === "Enter" && handlePillClick()}
-  >
-    <!-- Collapsed layer: dot + name -->
-    <div class="layer idle-layer">
-      <span
-        class="dot"
-        class:pulsing={isPulsing}
-        style="background:{dotColor};box-shadow:0 0 7px {dotColor}"
-      ></span>
-      <span class="brand-mini">Open Island</span>
+
+  <!-- ── Pill row (centers pill horizontally in the 480px window) ── -->
+  <div class="pill-row">
+    <div
+      class="pill"
+      role="button"
+      tabindex="0"
+      onclick={handlePillClick}
+      onkeydown={(e) => e.key === "Enter" && handlePillClick()}
+    >
+      <!-- Overlapping tool badges (urgent first, red + pulsing ring) -->
+      <div class="pill-badges">
+        {#each pillTopTools as t, i (i)}
+          <div class="badge-wrap" style="margin-left:{i === 0 ? 0 : -8}px; z-index:{pillTopTools.length - i};">
+            <div class="tool-badge tool-badge-26" class:tool-badge-red={isAwaiting && i === 0}>
+              {@html dotGlyph(TOOL_GLYPH_MAP[t] ?? "bash", 20, "#FFFFFF")}
+            </div>
+            {#if isAwaiting && i === 0}
+              <span class="ring-pulse"></span>
+            {/if}
+          </div>
+        {/each}
+      </div>
+
+      <!-- Agent count -->
       {#if activeSessions.length > 0}
-        <span class="work-badge">{activeSessions.length}</span>
+        <span class="pill-count">{activeSessions.length}</span>
+        <!-- Separator -->
+        <span class="pill-sep"></span>
       {/if}
-    </div>
 
-    <!-- Expanded layer: full bar -->
-    <div class="layer full-layer">
-      <div class="pill-left">
-        <span
-          class="dot"
-          class:pulsing={isPulsing}
-          style="background:{dotColor};box-shadow:0 0 7px {dotColor}"
-        ></span>
-        <span class="brand">Open Island</span>
-      </div>
-
-      <div class="pill-center">
-        {#if activeSessions.length === 0}
-          <span class="no-agents">no agents</span>
-        {:else}
-          {#each activeSessions.slice(0, 3) as s (s.session_id)}
-            <span class="chip">
-              <span class="chip-dot" style="background:{phaseColor(s.phase)};box-shadow:0 0 4px {phaseColor(s.phase)}"></span>
-              <span class="chip-cwd">{shortCwd(s.cwd)}</span>
-            </span>
-          {/each}
-          {#if activeSessions.length > 3}
-            <span class="more">+{activeSessions.length - 3}</span>
-          {/if}
-        {/if}
-      </div>
-
-      <div class="pill-right">
-        {#if hasPermission}
-          <span class="badge-perm">approval</span>
-        {:else if activeSessions.length > 0}
-          <span class="chevron">{userExpanded ? "▲" : "▼"}</span>
-        {/if}
-      </div>
+      <!-- Chevron (right side, rotates on expand) -->
+      <span class="pill-chevron" class:pill-chevron-up={userExpanded}>
+        {@html dotGlyph("chevronDown", 18, "var(--text-tertiary)")}
+      </span>
     </div>
   </div>
 
-  <!-- Permission panel -->
-  {#if hasPermission && permissionEvent}
-    <div class="perm-panel">
-      <div class="perm-row">
-        <span class="perm-icon">🔐</span>
-        <div class="perm-info">
-          <span class="perm-tool">{permissionEvent.toolName}</span>
-          {#if permissionEvent.toolInput}
-            <span class="perm-input">{formatInput(permissionEvent.toolInput)}</span>
+  <!-- ── Panel (slides open below pill) ── -->
+  <div class="panel-clip" class:panel-clip-open={userExpanded}>
+    <div class="panel" bind:this={panelEl}>
+
+      {#if panelVariant === "code" && urgentSession?.pending_permission}
+        <!-- Code approval panel -->
+        {@const perm = urgentSession.pending_permission}
+        {@const diff = buildDiff(perm)}
+
+        <!-- Awaiting header -->
+        <div class="aw-header">
+          <div class="badge-wrap">
+            <div class="tool-badge tool-badge-26 tool-badge-red">
+              {@html dotGlyph(TOOL_GLYPH_MAP[perm.tool_name] ?? "alert", 20, "#FFFFFF")}
+            </div>
+            <span class="ring-pulse ring-pulse-sm"></span>
+          </div>
+          <span class="aw-title">{diff.title}</span>
+          <span class="tag tag-red">AWAITING</span>
+          <span class="cond-time">{relTime(urgentSession.updated_at)}</span>
+        </div>
+
+        <!-- Diff block -->
+        {#if diff.lines.length > 0}
+          <div class="diff-block">
+            {#each diff.lines as l}
+              <div class="diff-line" class:diff-line-add={l.type === "add"} class:diff-line-del={l.type === "del"}>
+                <span class="diff-num">{l.num}</span>
+                <span class="diff-mark"
+                  class:diff-mark-add={l.type === "add"}
+                  class:diff-mark-del={l.type === "del"}
+                  class:diff-mark-ctx={l.type === "ctx"}>
+                  {l.type === "add" ? "+" : l.type === "del" ? "−" : " "}
+                </span>
+                <span class="diff-text"
+                  class:diff-text-add={l.type === "add"}
+                  class:diff-text-del={l.type === "del"}
+                  class:diff-text-ctx={l.type === "ctx"}>
+                  {l.text}
+                </span>
+              </div>
+            {/each}
+          </div>
+          <div class="diff-meta">
+            {#if diff.added > 0}<span class="diff-meta-add">+{diff.added}</span>{/if}
+            {#if diff.removed > 0}<span class="diff-meta-del">−{diff.removed}</span>{/if}
+            <span class="diff-meta-path">{diff.path}</span>
+          </div>
+        {/if}
+
+        <!-- OPEN TERMINAL button (Linux) — Allow/Deny buttons go here on Windows (WriteConsoleInput) -->
+        <div class="action-row">
+          <button
+            class="btn-open-terminal"
+            onclick={() => focusSession(urgentSession!.session_id)}
+          >
+            OPEN TERMINAL &nbsp;·&nbsp; <span class="kbd">1</span> ALLOW &nbsp; <span class="kbd">2</span> DENY
+          </button>
+        </div>
+        <!-- Windows port: replace action-row above with Deny + Allow pill buttons:
+        <div class="action-row">
+          <button class="btn-deny" onclick={() => handlePermission(false, urgentSession!.session_id)}>
+            Deny <span class="kbd">2</span>
+          </button>
+          <button class="btn-allow" onclick={() => handlePermission(true, urgentSession!.session_id)}>
+            Allow <span class="kbd">1</span>
+          </button>
+        </div>
+        -->
+
+        <!-- Other sessions (dim) -->
+        {#if otherSessions(urgentSession).length > 0}
+          <div class="hairline"></div>
+          {#each otherSessions(urgentSession) as s, i (s.session_id)}
+            {@render condensedRow(s, i === 0, true)}
+          {/each}
+        {/if}
+
+      {:else if panelVariant === "question" && urgentSession?.pending_question}
+        <!-- Question panel (dormant for v1 — backend doesn't populate pending_question yet) -->
+        {@const parsed = parseQuestion(urgentSession.pending_question)}
+
+        <div class="aw-header">
+          <div class="badge-wrap">
+            <div class="tool-badge tool-badge-26 tool-badge-red">
+              {@html dotGlyph("question", 20, "#FFFFFF")}
+            </div>
+            <span class="ring-pulse ring-pulse-sm"></span>
+          </div>
+          <span class="aw-title">Claude asks</span>
+          <span class="tag tag-red">ASKS</span>
+          <span class="cond-time">{relTime(urgentSession.updated_at)}</span>
+        </div>
+
+        <div class="q-block">
+          <p class="q-text">{parsed.question}</p>
+          {#if parsed.options.length > 0}
+            <div class="q-opts">
+              {#each parsed.options as opt, i (i)}
+                <button class="q-opt" onclick={() => focusSession(urgentSession!.session_id)}>
+                  <span class="kbd">{i + 1}</span>
+                  <span class="q-opt-text">{opt}</span>
+                </button>
+              {/each}
+            </div>
+          {:else}
+            <button class="btn-open-terminal" onclick={() => focusSession(urgentSession!.session_id)}>
+              OPEN TERMINAL
+            </button>
           {/if}
         </div>
-        <div class="perm-btns">
-          <button class="btn-deny" onclick={() => handlePermission(false)}>Deny</button>
-          <button class="btn-allow" onclick={() => handlePermission(true)}>Allow</button>
-        </div>
-      </div>
-    </div>
-  {/if}
 
-  <!-- Session list -->
-  {#if userExpanded && !hasPermission && activeSessions.length > 0}
-    <div class="session-list">
-      {#each activeSessions as s (s.session_id)}
-        <div class="session-row">
-          <span class="s-dot" style="background:{phaseColor(s.phase)};box-shadow:0 0 4px {phaseColor(s.phase)}"></span>
-          <div class="s-info">
-            <span class="s-cwd">{shortCwd(s.cwd)}</span>
-            {#if s.summary}
-              <span class="s-summary">{s.summary}</span>
-            {/if}
+        {#if otherSessions(urgentSession).length > 0}
+          <div class="hairline"></div>
+          {#each otherSessions(urgentSession) as s, i (s.session_id)}
+            {@render condensedRow(s, i === 0, true)}
+          {/each}
+        {/if}
+
+      {:else}
+        <!-- Session list panel (quiet) -->
+        {#if activeSessions.length === 0}
+          <div class="cond-row cond-row-first">
+            <div class="tool-badge tool-badge-22">
+              {@html dotGlyph("power", 16, "var(--text-disabled)")}
+            </div>
+            <span class="cond-project" style="color:var(--text-tertiary)">No active agents</span>
           </div>
-        </div>
-      {/each}
+        {:else}
+          {#each activeSessions as s, i (s.session_id)}
+            {@render condensedRow(s, i === 0, false)}
+          {/each}
+        {/if}
+      {/if}
+
     </div>
-  {/if}
+  </div>
+
 </div>
 </div>
+
+<!-- ── Snippet: CondensedRow ─────────────────────────────────────────────── -->
+{#snippet condensedRow(s: Session, first: boolean, dim: boolean)}
+  {@const tool = currentToolOf(s)}
+  {@const label = TOOL_LABEL[tool] ?? tool.toUpperCase()}
+  <div
+    class="cond-row"
+    class:cond-row-first={first}
+    class:cond-row-dim={dim}
+    role="button"
+    tabindex="0"
+    onclick={() => focusSession(s.session_id)}
+    onkeydown={(e) => e.key === "Enter" && focusSession(s.session_id)}
+  >
+    <div class="tool-badge tool-badge-22">
+      {@html dotGlyph(TOOL_GLYPH_MAP[tool] ?? "bash", 16, "#FFFFFF")}
+    </div>
+    <span class="cond-project">{shortCwd(s.cwd)}</span>
+    <span class="tag">{label}</span>
+    <span class="cond-time">{relTime(s.started_at)}</span>
+  </div>
+{/snippet}
 
 <style>
+  /* ── Nothing DS foundation tokens ──────────────────────────────────────── */
+  :global(:root) {
+    --nothing-red:         #D81F26;
+    --nothing-red-hover:   #B81920;
+    --nothing-white:       #FFFFFF;
+    --nothing-black:       #000000;
+    --surface-0:           #000000;
+    --surface-1:           #121212;
+    --surface-2:           #1F1F1F;
+    --surface-3:           #2B2B2B;
+    --text-primary:        #FFFFFF;
+    --text-secondary:      #BFBFBF;
+    --text-tertiary:       #7A7A7A;
+    --text-disabled:       #3D3D3D;
+    --divider:             #2B2B2B;
+    --font-body:           "NType 82", system-ui, -apple-system, "Helvetica Neue", sans-serif;
+    --font-mono:           "JetBrains Mono", "IBM Plex Mono", monospace;
+    --font-display:        "Ndot-57", "JetBrains Mono", monospace;
+    --ease:                cubic-bezier(0.2, 0, 0, 1);
+  }
+
   :global(*) { box-sizing: border-box; margin: 0; padding: 0; }
 
   :global(html, body) {
@@ -239,322 +587,412 @@
     -webkit-user-select: none;
   }
 
-  /* Untransformed outer wrapper — preserves full hit area for hover detection */
+  /* ── Keyframes ──────────────────────────────────────────────────────────── */
+  @keyframes oi-pulse {
+    0%, 100% { opacity: 0.2; }
+    40%      { opacity: 1;   }
+  }
+
+  @keyframes oi-ring {
+    0%   { box-shadow: 0 0 0 2px rgba(216,31,38,1);   opacity: 1; transform: scale(1);    }
+    100% { box-shadow: 0 0 0 6px rgba(216,31,38,0);   opacity: 0; transform: scale(1.15); }
+  }
+
+  /* ── Layout shell ───────────────────────────────────────────────────────── */
   .hover-wrapper {
     width: 100%;
+    height: 100%;
   }
 
   .root {
-    width: 100%;
-    overflow: hidden;
     display: flex;
     flex-direction: column;
-    gap: 3px;
-    transform: translateY(0);
-    transition: transform 0.32s cubic-bezier(0.34, 1.56, 0.64, 1);
-  }
-
-  /* Idle: push pill up so only bottom SLIVER_H (10px) peeks below the KDE panel */
-  .root.sliver {
-    transform: translateY(-28px); /* PILL_H_IDLE(38) - SLIVER_H(10) = 28 */
-  }
-
-  /* ── Pill ── */
-  .pill {
-    position: relative;
-    height: 38px;
-    background: rgba(10, 10, 17, 0.97);
-    backdrop-filter: blur(32px);
-    border: 1px solid rgba(255,255,255,0.07);
-    border-radius: 0 0 10px 10px;
-    cursor: pointer;
-    overflow: hidden;
-    transition:
-      height        0.32s cubic-bezier(0.34, 1.56, 0.64, 1),
-      border-radius 0.32s ease,
-      background    0.25s ease;
-    -webkit-app-region: drag;
-  }
-
-  .pill.expanded {
-    height: 60px;
-    border-radius: 0 0 14px 14px;
-    background: rgba(12, 12, 20, 0.98);
-  }
-
-  .pill:hover { background: rgba(18, 18, 26, 0.98); }
-  .pill.expanded:hover { background: rgba(15, 15, 23, 0.99); }
-
-  /* Content layers — stacked, cross-fade */
-  .layer {
-    position: absolute;
-    inset: 0;
-    display: flex;
     align-items: center;
-    transition: opacity 0.22s ease;
+    width: 100%;
+    transform: translateY(0);
+    transition: transform 500ms var(--ease);
+  }
+
+  .root.sliver {
+    transform: translateY(-30px);
+  }
+
+  /* ── Pill row + pill ────────────────────────────────────────────────────── */
+  .pill-row {
+    display: flex;
+    justify-content: center;
+    width: 100%;
+  }
+
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 14px;
+    height: 44px;
+    padding: 0 16px;
+    background: #0A0A0A;
+    color: var(--text-primary);
+    border-radius: 0 0 12px 12px;
+    box-shadow: 0 6px 20px rgba(0,0,0,0.55), 0 0 0 1px rgba(255,255,255,0.04) inset;
+    font-family: var(--font-body);
+    cursor: pointer;
+    -webkit-app-region: drag;
+    transition: background 150ms linear;
+  }
+
+  .pill:hover { background: #121212; }
+
+  /* ── Pill badge cluster ─────────────────────────────────────────────────── */
+  .pill-badges {
+    display: inline-flex;
+    align-items: center;
     -webkit-app-region: no-drag;
   }
 
-  .idle-layer {
+  .badge-wrap {
+    position: relative;
+    display: inline-flex;
+    flex-shrink: 0;
+  }
+
+  /* ── Tool badges ────────────────────────────────────────────────────────── */
+  .tool-badge {
+    background: var(--surface-2);
+    display: flex;
+    align-items: center;
     justify-content: center;
-    gap: 8px;
-    padding: 0 14px;
-    opacity: 1;
-  }
-
-  .full-layer {
-    padding: 0 20px;
-    gap: 12px;
-    opacity: 0;
-    pointer-events: none;
-  }
-
-  .pill.expanded .idle-layer {
-    opacity: 0;
-    pointer-events: none;
-  }
-
-  .pill.expanded .full-layer {
-    opacity: 1;
-    pointer-events: auto;
-  }
-
-  /* Dot */
-  .dot {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
     flex-shrink: 0;
-    transition: background 0.4s ease, box-shadow 0.4s ease;
-  }
-  .dot.pulsing { animation: pulse 1.9s ease-in-out infinite; }
-
-  /* Collapsed labels */
-  .brand-mini {
-    font-size: 11px;
-    font-weight: 600;
-    color: #606080;
-    letter-spacing: 0.02em;
-    font-family: -apple-system, "Inter", "Segoe UI", sans-serif;
-  }
-
-  .work-badge {
-    font-size: 10px;
-    color: #9080ff;
-    background: rgba(124,106,247,0.14);
     border-radius: 8px;
-    padding: 1px 6px;
   }
 
-  /* Expanded left */
-  .pill-left {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    flex-shrink: 0;
+  .tool-badge-26 { width: 26px; height: 26px; }
+  .tool-badge-22 { width: 22px; height: 22px; }
+  .tool-badge-red { background: var(--nothing-red); }
+
+  /* ── Pulsing ring around urgent badge ──────────────────────────────────── */
+  .ring-pulse {
+    position: absolute;
+    inset: -5px;
+    border-radius: 14px;
+    box-shadow: 0 0 0 2px var(--nothing-red);
+    animation: oi-ring 1400ms var(--ease) infinite;
+    pointer-events: none;
   }
 
-  .brand {
-    font-size: 12px;
+  .ring-pulse-sm {
+    inset: -4px;
+    border-radius: 12px;
+  }
+
+  /* ── Pill count ─────────────────────────────────────────────────────────── */
+  .pill-count {
+    font-family: var(--font-mono);
+    font-size: 13px;
     font-weight: 600;
-    color: #b8b8cc;
-    letter-spacing: 0.01em;
-    font-family: -apple-system, "Inter", "Segoe UI", sans-serif;
-  }
-
-  /* Expanded center */
-  .pill-center {
-    flex: 1;
-    min-width: 0;
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    overflow: hidden;
-  }
-
-  .no-agents {
-    font-size: 11px;
-    color: #252535;
-    font-family: -apple-system, "Inter", "Segoe UI", sans-serif;
-  }
-
-  .chip {
-    display: flex;
-    align-items: center;
-    gap: 5px;
-    background: rgba(255,255,255,0.05);
-    border-radius: 9px;
-    padding: 2px 8px;
-    min-width: 0;
-  }
-
-  .chip-dot {
-    width: 5px;
-    height: 5px;
-    border-radius: 50%;
+    color: var(--text-primary);
+    letter-spacing: 0.04em;
     flex-shrink: 0;
-    animation: pulse 1.9s ease-in-out infinite;
+    -webkit-app-region: no-drag;
   }
 
-  .chip-cwd {
-    font-size: 11px;
-    color: #8888a8;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    max-width: 130px;
-    font-family: monospace;
-  }
-
-  .more {
-    font-size: 10px;
-    color: #3a3a55;
-  }
-
-  /* Expanded right */
-  .pill-right {
+  /* ── Separator ──────────────────────────────────────────────────────────── */
+  .pill-sep {
+    width: 1px;
+    height: 18px;
+    background: var(--divider);
     flex-shrink: 0;
-    display: flex;
+  }
+
+  /* ── Chevron (right side) ───────────────────────────────────────────────── */
+  .pill-chevron {
+    display: inline-flex;
     align-items: center;
+    flex-shrink: 0;
+    -webkit-app-region: no-drag;
+    transform: rotate(0deg);
+    transition: transform 350ms var(--ease);
   }
 
-  .badge-perm {
-    font-size: 10px;
-    color: #f5a623;
-    background: rgba(245,166,35,0.11);
-    border-radius: 7px;
-    padding: 2px 8px;
-    animation: pulse 1.2s ease-in-out infinite;
-    font-family: -apple-system, "Inter", "Segoe UI", sans-serif;
+  .pill-chevron-up {
+    transform: rotate(180deg);
   }
 
-  .chevron {
-    font-size: 9px;
-    color: #38384e;
+  /* ── Panel clip (overflow + transition) ─────────────────────────────────── */
+  .panel-clip {
+    overflow: hidden;
+    max-height: 0;
+    opacity: 0;
+    transform: translateY(-8px);
+    transition:
+      max-height 450ms var(--ease),
+      opacity    300ms var(--ease),
+      transform  400ms var(--ease);
+    margin-top: 0;
+    width: 100%;
+    display: flex;
+    justify-content: center;
   }
 
-  /* ── Permission panel ── */
-  .perm-panel {
-    background: rgba(18, 10, 32, 0.95);
-    border: 1px solid rgba(124,106,247,0.28);
-    border-radius: 16px;
-    padding: 11px 15px;
+  .panel-clip-open {
+    max-height: 600px;
+    opacity: 1;
+    transform: translateY(0);
+    margin-top: 8px;
   }
 
-  .perm-row {
+  /* ── Panel shell ────────────────────────────────────────────────────────── */
+  .panel {
+    width: 480px;
+    background: #0A0A0A;
+    border-radius: 18px;
+    overflow: hidden;
+    box-shadow: 0 12px 32px rgba(0,0,0,0.65), 0 0 0 1px rgba(255,255,255,0.04) inset;
+  }
+
+  /* ── Condensed row ──────────────────────────────────────────────────────── */
+  .cond-row {
     display: flex;
     align-items: center;
     gap: 10px;
-  }
-
-  .perm-icon { font-size: 17px; flex-shrink: 0; }
-
-  .perm-info {
-    flex: 1;
-    min-width: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-  }
-
-  .perm-tool {
-    font-size: 12px;
-    font-weight: 600;
-    color: #c0a0f0;
-    font-family: monospace;
-  }
-
-  .perm-input {
-    font-size: 10px;
-    color: #505068;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  .perm-btns {
-    display: flex;
-    gap: 6px;
-    flex-shrink: 0;
-  }
-
-  button {
-    font-size: 11px;
-    font-weight: 500;
-    padding: 5px 13px;
-    border-radius: 9px;
-    border: none;
+    padding: 10px 14px;
+    border-top: 1px solid var(--divider);
     cursor: pointer;
-    transition: all 0.15s;
-    font-family: -apple-system, "Inter", "Segoe UI", sans-serif;
+    transition: background 150ms var(--ease);
   }
 
-  .btn-deny {
-    background: rgba(224,85,85,0.13);
-    color: #e05555;
-    border: 1px solid rgba(224,85,85,0.22);
-  }
-  .btn-deny:hover { background: rgba(224,85,85,0.28); }
+  .cond-row:hover { background: rgba(255,255,255,0.03); }
+  .cond-row-first { border-top: none; }
+  .cond-row-dim   { opacity: 0.85; }
 
-  .btn-allow {
-    background: #7c6af7;
-    color: white;
-  }
-  .btn-allow:hover { background: #9080ff; }
-
-  /* ── Session list ── */
-  .session-list {
-    background: rgba(13, 13, 21, 0.9);
-    border: 1px solid rgba(255,255,255,0.05);
-    border-radius: 16px;
-    padding: 3px 8px;
-    display: flex;
-    flex-direction: column;
+  .cond-project {
+    font-family: var(--font-body);
+    font-size: 12.5px;
+    font-weight: 500;
+    color: var(--text-primary);
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
-  .session-row {
+  .cond-time {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    color: var(--text-tertiary);
+    letter-spacing: 0.02em;
+    min-width: 22px;
+    text-align: right;
+    flex-shrink: 0;
+  }
+
+  /* ── Tag ────────────────────────────────────────────────────────────────── */
+  .tag {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 7px;
+    border-radius: 6px;
+    background: var(--surface-2);
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.04em;
+    color: var(--text-secondary);
+    font-weight: 500;
+    line-height: 1.5;
+    flex-shrink: 0;
+  }
+
+  .tag-red {
+    background: rgba(216,31,38,0.18);
+    color: var(--nothing-red);
+  }
+
+  /* ── Kbd ────────────────────────────────────────────────────────────────── */
+  .kbd {
+    display: inline-flex;
+    align-items: center;
+    padding: 1px 5px;
+    border-radius: 4px;
+    background: rgba(255,255,255,0.08);
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--text-secondary);
+    font-weight: 500;
+    line-height: 1.4;
+  }
+
+  /* ── Awaiting header ────────────────────────────────────────────────────── */
+  .aw-header {
     display: flex;
     align-items: center;
     gap: 10px;
-    padding: 7px 10px;
-    border-radius: 11px;
-    transition: background 0.1s;
-  }
-  .session-row:hover { background: rgba(255,255,255,0.03); }
-
-  .s-dot {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    flex-shrink: 0;
-    animation: pulse 1.9s ease-in-out infinite;
+    padding: 14px 14px 10px;
   }
 
-  .s-info {
-    display: flex;
-    flex-direction: column;
-    gap: 1px;
+  .aw-title {
+    font-family: var(--font-body);
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+    flex: 1;
     min-width: 0;
-  }
-
-  .s-cwd {
-    font-size: 12px;
-    color: #b8b8cc;
-    font-weight: 500;
-    font-family: -apple-system, "Inter", "Segoe UI", sans-serif;
-  }
-
-  .s-summary {
-    font-size: 10px;
-    color: #484860;
-    white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    font-family: -apple-system, "Inter", "Segoe UI", sans-serif;
+    white-space: nowrap;
   }
 
-  @keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50%       { opacity: 0.3; }
+  /* ── Diff block ─────────────────────────────────────────────────────────── */
+  .diff-block {
+    margin: 0 14px;
+    background: #000;
+    border-radius: 10px;
+    padding: 8px 0;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    line-height: 1.5;
+    overflow: hidden;
+  }
+
+  .diff-line {
+    display: flex;
+    align-items: center;
+    padding: 2px 0;
+  }
+
+  .diff-line-add { background: rgba(70,180,90,0.10); }
+  .diff-line-del { background: rgba(216,31,38,0.14); }
+
+  .diff-num {
+    width: 30px;
+    color: var(--text-tertiary);
+    text-align: right;
+    padding-right: 8px;
+    font-size: 10.5px;
+    flex-shrink: 0;
+  }
+
+  .diff-mark {
+    width: 14px;
+    text-align: center;
+    flex-shrink: 0;
+  }
+
+  .diff-mark-add { color: rgb(120,210,140); }
+  .diff-mark-del { color: rgb(240,120,125); }
+  .diff-mark-ctx { color: var(--text-tertiary); }
+
+  .diff-text      { flex: 1; padding-right: 12px; }
+  .diff-text-add  { color: rgb(170,225,185); }
+  .diff-text-del  { color: rgb(240,150,155); }
+  .diff-text-ctx  { color: var(--text-secondary); }
+
+  .diff-meta {
+    padding: 8px 14px 12px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+  }
+
+  .diff-meta-add  { color: rgb(140,220,160); font-weight: 500; }
+  .diff-meta-del  { color: rgb(240,150,155); font-weight: 500; }
+  .diff-meta-path {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--text-tertiary);
+    letter-spacing: 0.06em;
+    margin-left: auto;
+    text-transform: uppercase;
+  }
+
+  /* ── Action row ─────────────────────────────────────────────────────────── */
+  .action-row {
+    padding: 8px 12px 12px;
+    display: flex;
+    gap: 8px;
+  }
+
+  .btn-open-terminal {
+    flex: 1;
+    height: 36px;
+    border-radius: 10px;
+    border: 0;
+    cursor: pointer;
+    background: var(--nothing-red);
+    color: var(--nothing-white);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    transition: background 150ms var(--ease);
+  }
+
+  .btn-open-terminal:hover { background: var(--nothing-red-hover); }
+
+  /* Windows port button styles (kept for reference):
+  .btn-deny {
+    flex: 1; height: 36px; border-radius: 10px; cursor: pointer;
+    background: rgba(255,255,255,0.06); color: var(--text-primary);
+    border: 1px solid var(--surface-3);
+    display: flex; align-items: center; justify-content: center; gap: 8px;
+    font-family: var(--font-body); font-size: 12.5px; font-weight: 500;
+  }
+  .btn-allow {
+    flex: 1; height: 36px; border-radius: 10px; border: 0; cursor: pointer;
+    background: var(--nothing-red); color: var(--nothing-white);
+    display: flex; align-items: center; justify-content: center; gap: 8px;
+    font-family: var(--font-body); font-size: 12.5px; font-weight: 600;
+  }
+  */
+
+  /* ── Hairline divider ───────────────────────────────────────────────────── */
+  .hairline {
+    height: 1px;
+    background: var(--divider);
+  }
+
+  /* ── Question block ─────────────────────────────────────────────────────── */
+  .q-block {
+    padding: 2px 14px 12px;
+  }
+
+  .q-text {
+    margin: 0 0 10px;
+    font-size: 13px;
+    color: var(--text-primary);
+    line-height: 1.45;
+  }
+
+  .q-opts {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+  }
+
+  .q-opt {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 9px 11px;
+    border-radius: 9px;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid var(--surface-2);
+    color: var(--text-primary);
+    cursor: pointer;
+    text-align: left;
+    font-family: var(--font-body);
+    transition: background 150ms var(--ease);
+  }
+
+  .q-opt:hover { background: rgba(255,255,255,0.07); }
+
+  .q-opt-text {
+    font-size: 12.5px;
+    font-weight: 500;
   }
 </style>

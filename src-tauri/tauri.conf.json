@@ -13,8 +13,8 @@
       {
         "label": "main",
         "title": "Open Island",
-        "width": 200,
-        "height": 38,
+        "width": 480,
+        "height": 44,
         "resizable": false,
         "decorations": false,
         "transparent": true,

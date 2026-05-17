@@ -11,9 +11,9 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use uuid::Uuid;
 
 use super::protocol::*;
-use super::state::{AgentSession, BridgeState, PendingPermission, SessionPhase};
+use super::state::{BridgeState, PendingPermission, SessionPhase};
 
-pub type SessionsSnapshot = Vec<AgentSession>;
+pub type SessionsSnapshot = Vec<super::state::AgentSession>;
 
 #[derive(Debug)]
 pub enum ServerEvent {
@@ -30,14 +30,11 @@ pub enum ServerEvent {
     },
 }
 
-struct PendingApproval {
-    tx: oneshot::Sender<ClaudeHookDirective>,
-}
-
 pub(crate) struct ServerInner {
     state: BridgeState,
-    pending_approvals: HashMap<String, PendingApproval>,
     event_tx: mpsc::UnboundedSender<ServerEvent>,
+    /// Pending pill decisions: session_id → oneshot sender pushed to the hook connection.
+    pending_hook_decisions: HashMap<String, oneshot::Sender<PermissionResolution>>,
 }
 
 impl ServerInner {
@@ -54,7 +51,7 @@ impl ServerInner {
         ));
     }
 
-    fn handle_claude_hook(&mut self, payload: ClaudeHookPayload) -> Option<oneshot::Receiver<ClaudeHookDirective>> {
+    fn handle_claude_hook(&mut self, payload: ClaudeHookPayload) {
         let ts = Self::now();
         let sid = payload.session_id.clone();
 
@@ -63,10 +60,9 @@ impl ServerInner {
             "sessionstart" => {
                 self.state.get_or_create(&sid, payload.cwd.clone(), None, ts);
                 self.emit_snapshot();
-                None
             }
 
-            "pretooluse" => {
+            "pretooluse" | "permissionrequest" => {
                 let tool_name = payload.tool_name.clone().unwrap_or_default();
                 let tool_input = payload.tool_input.clone();
 
@@ -74,6 +70,11 @@ impl ServerInner {
 
                 let session = self.state.get_or_create(&sid, payload.cwd.clone(), None, ts);
                 session.updated_at = ts;
+
+                // Store the terminal tty so pill-side Allow/Deny can target the right window
+                if payload.terminal_tty.is_some() {
+                    session.terminal_tty = payload.terminal_tty.clone();
+                }
 
                 if needs_approval {
                     session.phase = SessionPhase::AwaitingPermission;
@@ -84,63 +85,43 @@ impl ServerInner {
                     self.emit_snapshot();
 
                     let _ = self.event_tx.send(ServerEvent::PermissionRequested {
-                        session_id: sid.clone(),
+                        session_id: sid,
                         tool_name,
                         tool_input,
                     });
-
-                    let (tx, rx) = oneshot::channel();
-                    self.pending_approvals.insert(sid, PendingApproval { tx });
-                    Some(rx)
                 } else {
                     session.phase = SessionPhase::Working;
                     session.summary = Some(format!("Running {}", tool_name));
                     self.emit_snapshot();
-                    None
                 }
-            }
-
-            "permissionrequest" => {
-                let tool_name = payload.tool_name.clone().unwrap_or_default();
-                let tool_input = payload.tool_input.clone();
-
-                let session = self.state.get_or_create(&sid, payload.cwd.clone(), None, ts);
-                session.phase = SessionPhase::AwaitingPermission;
-                session.updated_at = ts;
-                session.pending_permission = Some(PendingPermission {
-                    tool_name: tool_name.clone(),
-                    tool_input: tool_input.clone(),
-                });
-                self.emit_snapshot();
-
-                let _ = self.event_tx.send(ServerEvent::PermissionRequested {
-                    session_id: sid.clone(),
-                    tool_name,
-                    tool_input,
-                });
-
-                let (tx, rx) = oneshot::channel();
-                self.pending_approvals.insert(sid, PendingApproval { tx });
-                Some(rx)
             }
 
             "posttooluse" | "posttoolusefailure" => {
                 if let Some(session) = self.state.sessions.get_mut(&sid) {
+                    let was_awaiting = session.pending_permission.is_some();
                     session.phase = SessionPhase::Working;
                     session.pending_permission = None;
                     session.updated_at = ts;
+                    if was_awaiting {
+                        let _ = self.event_tx.send(ServerEvent::PermissionResolved(sid.clone()));
+                    }
                 }
+                // Hook resolved via tty — drop any pending pill-decision channel
+                self.pending_hook_decisions.remove(&sid);
                 self.emit_snapshot();
-                None
             }
 
             "stop" | "sessionend" => {
                 if let Some(session) = self.state.sessions.get_mut(&sid) {
+                    let was_awaiting = session.pending_permission.is_some();
                     session.phase = SessionPhase::Completed;
+                    session.pending_permission = None;
                     session.updated_at = ts;
+                    if was_awaiting {
+                        let _ = self.event_tx.send(ServerEvent::PermissionResolved(sid.clone()));
+                    }
                 }
                 self.emit_snapshot();
-                None
             }
 
             "notification" | "userpromptsubmit" => {
@@ -148,11 +129,9 @@ impl ServerInner {
                     title: payload.title.clone(),
                     message: payload.message.clone().unwrap_or_default(),
                 });
-                None
             }
 
             _ => {
-                // For any other hook event, update the session as active
                 if let Some(session) = self.state.sessions.get_mut(&sid) {
                     session.updated_at = ts;
                     if let Some(msg) = &payload.last_assistant_message {
@@ -163,18 +142,15 @@ impl ServerInner {
                     }
                 }
                 self.emit_snapshot();
-                None
             }
         }
     }
 
     fn resolve_permission(&mut self, session_id: &str, resolution: PermissionResolution) {
-        if let Some(approval) = self.pending_approvals.remove(session_id) {
-            let directive = match resolution {
-                PermissionResolution::Allow => ClaudeHookDirective::Allow,
-                PermissionResolution::Deny { message } => ClaudeHookDirective::Deny { message },
-            };
-            let _ = approval.tx.send(directive);
+        // Push the decision to the hook that is blocking on the socket.
+        // If the hook already resolved via tty, the send fails silently — that's fine.
+        if let Some(tx) = self.pending_hook_decisions.remove(session_id) {
+            let _ = tx.send(resolution);
         }
 
         if let Some(session) = self.state.sessions.get_mut(session_id) {
@@ -198,15 +174,14 @@ impl BridgeServer {
         Self {
             inner: Arc::new(Mutex::new(ServerInner {
                 state: BridgeState::default(),
-                pending_approvals: HashMap::new(),
                 event_tx: tx,
+                pending_hook_decisions: HashMap::new(),
             })),
             event_rx: Some(rx),
         }
     }
 
     pub fn socket_path() -> PathBuf {
-        // Honour env override (compatible with open-vibe-island hooks)
         if let Ok(p) = std::env::var("OPEN_ISLAND_SOCKET_PATH") {
             return PathBuf::from(p);
         }
@@ -268,7 +243,6 @@ async fn handle_client(stream: UnixStream, inner: Arc<Mutex<ServerInner>>) -> Re
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut lines = BufReader::new(read_half).lines();
 
-    // Channels for deferred hook responses
     let (resp_tx, mut resp_rx) = mpsc::unbounded_channel::<String>();
 
     let write_task = tokio::spawn(async move {
@@ -292,61 +266,42 @@ async fn handle_client(stream: UnixStream, inner: Arc<Mutex<ServerInner>>) -> Re
             }
         };
 
+        let ack = serde_json::to_string(&BridgeEnvelope::Response {
+            response: BridgeResponse::Acknowledged,
+        })?;
+
         match envelope {
             BridgeEnvelope::Hello(_) => {
-                let ack = serde_json::to_string(&BridgeEnvelope::Response {
-                    response: BridgeResponse::Acknowledged,
-                })?;
                 resp_tx.send(ack)?;
             }
 
             BridgeEnvelope::Command { command } => {
                 match command {
                     BridgeCommand::RegisterClient { .. } => {
-                        let ack = serde_json::to_string(&BridgeEnvelope::Response {
-                            response: BridgeResponse::Acknowledged,
-                        })?;
                         resp_tx.send(ack)?;
                     }
 
                     BridgeCommand::ProcessClaudeHook { claude_hook } => {
-                        let approval_rx = {
+                        {
                             let mut guard = inner.lock().await;
-                            guard.handle_claude_hook(claude_hook)
-                        };
-
-                        if let Some(rx) = approval_rx {
-                            let resp_tx = resp_tx.clone();
-                            tokio::spawn(async move {
-                                let directive = rx.await.unwrap_or(ClaudeHookDirective::Allow);
-                                let env = BridgeEnvelope::Response {
-                                    response: BridgeResponse::ClaudeHookDirective { directive },
-                                };
-                                if let Ok(json) = serde_json::to_string(&env) {
-                                    let _ = resp_tx.send(json);
-                                }
-                            });
-                        } else {
-                            let ack = serde_json::to_string(&BridgeEnvelope::Response {
-                                response: BridgeResponse::Acknowledged,
-                            })?;
-                            resp_tx.send(ack)?;
+                            guard.handle_claude_hook(claude_hook);
                         }
+                        resp_tx.send(ack)?;
+                        // Windows port: re-add the socket-hold block here so resolve_permission
+                        // can push a ClaudeHookDirective back to the hook for WriteConsoleInput.
+                        // See project_open_island_crossplatform memory and pending_hook_decisions
+                        // in ServerInner (preserved for this purpose).
                     }
 
                     BridgeCommand::ResolvePermission { session_id, resolution } => {
-                        let mut guard = inner.lock().await;
-                        guard.resolve_permission(&session_id, resolution);
-                        let ack = serde_json::to_string(&BridgeEnvelope::Response {
-                            response: BridgeResponse::Acknowledged,
-                        })?;
+                        {
+                            let mut guard = inner.lock().await;
+                            guard.resolve_permission(&session_id, resolution);
+                        }
                         resp_tx.send(ack)?;
                     }
 
                     BridgeCommand::AnswerQuestion { .. } => {
-                        let ack = serde_json::to_string(&BridgeEnvelope::Response {
-                            response: BridgeResponse::Acknowledged,
-                        })?;
                         resp_tx.send(ack)?;
                     }
                 }
@@ -361,7 +316,7 @@ async fn handle_client(stream: UnixStream, inner: Arc<Mutex<ServerInner>>) -> Re
     Ok(())
 }
 
-// Tools that can modify filesystem, run shell commands, or have side effects
+// Tools that block for approval
 fn requires_approval(tool_name: &str) -> bool {
     matches!(
         tool_name,

@@ -27,6 +27,7 @@ pub struct AgentSession {
     pub summary: Option<String>,
     pub pending_permission: Option<PendingPermission>,
     pub pending_question: Option<String>,
+    pub terminal_tty: Option<String>,
     pub started_at: f64,
     pub updated_at: f64,
 }
@@ -41,6 +42,7 @@ impl AgentSession {
             summary: None,
             pending_permission: None,
             pending_question: None,
+            terminal_tty: None,
             started_at: timestamp,
             updated_at: timestamp,
         }
