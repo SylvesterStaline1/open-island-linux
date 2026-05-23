@@ -152,6 +152,16 @@ Hook event names from Claude Code are PascalCase (`SessionStart`, not `sessionSt
 - Available glyph keys: `bash`, `edit`, `write`, `multiedit`, `notebook`, `webfetch`, `websearch`, `read`, `check`, `alert`, `power`, `question`, `chevronDown`, `chevronUp`, `close`, `play`.
 - Pulsing: wrap glyph `{@html ...}` in `<span class:pulsing={condition}>` — the `.pulsing` CSS class applies opacity animation.
 
+## Windows port plan
+
+The app targets Windows as the commercial platform after Linux. Design decisions to keep in mind:
+
+- **IPC**: Unix socket → Windows named pipe `\\.\pipe\open-island`. Abstract `BridgeServer::socket_path()` behind a platform branch (`#[cfg(windows)]`) returning the pipe path. The hook relay connects to a named pipe instead.
+- **Allow/Deny**: On Linux the user presses `1`/`2` in the terminal (hook reads `/dev/tty`). On Windows, the hook uses `WriteConsoleInput` — unprivileged, targets the specific console by handle — to inject the keypress. This is OOTB on Windows (no elevated rights needed). The pill's Deny/Allow buttons are already stubbed in `App.svelte` (commented, labeled "Windows port: WriteConsoleInput").
+- **Permission flow on Windows**: The hook must hold the socket connection open while waiting for a pill decision (blocked on `pending_hook_decisions` oneshot channel). `server.rs:292` has a comment marking exactly where to re-add the socket-hold block.
+- **Window positioning**: `GDK_BACKEND=x11` and `plasmashellrc` panel detection are Linux-only. On Windows, use `MonitorFromWindow` / `GetMonitorInfo` via Tauri's monitor APIs — same `primary_monitor()` + `LogicalSize`/`LogicalPosition` pattern works cross-platform.
+- **`#[cfg]` strategy**: Use `#[cfg(target_os = "linux")]` / `#[cfg(windows)]` branches rather than runtime checks. Keep the shared logic (session state, IPC protocol, UI) fully platform-agnostic.
+
 ## Known issues / gotchas
 - `_NET_WORKAREA` returns y=0 on KDE Wayland + XWayland — useless for panel detection. Use `~/.config/plasmashellrc` `thickness=` instead.
 - `current_monitor()` returns None when called before the WM maps the window — use `primary_monitor()` instead.
