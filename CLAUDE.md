@@ -157,8 +157,11 @@ Hook event names from Claude Code are PascalCase (`SessionStart`, not `sessionSt
 - `current_monitor()` returns None when called before the WM maps the window — use `primary_monitor()` instead.
 - `set_size(PhysicalSize(w, h))` on a 2x display creates a half-logical-pixel window — always use `LogicalSize`.
 - Terminal may be left in raw mode after a Tauri panic — run `reset` to fix.
+- `win.outer_size()` is unreliable before `win.show()` — XWayland reports stale/wrong values on the unmapped window. Use the `PILL_WIDTH` constant in `lib.rs` (or pass the known width explicitly) rather than querying at startup.
+- XWayland doubles all X11 window coordinates when reported back via wmctrl (e.g. `set_position(LogicalPosition(720,28))` → wmctrl shows `(1440,56)`). This is correct and expected — the visual position IS centered; the doubling is XWayland's coordinate mapping. Do NOT compensate for this by halving the computed position; that breaks centering. The formula `x = (mon_w - width) / 2` producing `x=720` → wmctrl `1440` → visually centered is intentional.
 - The user has two monitors: external DP-2 (top, NOT primary) and laptop eDP-1 (bottom, PRIMARY). The pill goes on eDP-1. Do NOT switch to a "topmost monitor" heuristic.
 - `set_window_geometry` spawns a delayed 80ms repositioning task — do not call it in a tight loop.
+- `.panel-clip` does NOT use `max-height` animation. In WebKit2GTK, animating `max-height` on a flex container constrained `.panel` (flex child) to the intermediate animation value, causing ResizeObserver to under-report panel height, which caused the window to be sized too short and clip content. The fix: remove `max-height` entirely from `.panel-clip`; use only `opacity` + `transform` for visual animation. The window resize via `set_window_geometry` IS the reveal — the body's `overflow: hidden` clips the full-height panel when the window is small.
 
 ## Svelte 5 notes
 - Uses rune API: `$state`, `$derived`, `$effect`

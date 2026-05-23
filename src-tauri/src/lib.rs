@@ -14,6 +14,10 @@ use tauri::{
 use tokio::sync::Mutex;
 use tauri::async_runtime;
 
+/// Logical pixel width of the pill window. Must match `tauri.conf.json` `width`
+/// and `WIN_W` in `src/App.svelte`.
+const PILL_WIDTH: u32 = 480;
+
 pub struct AppState {
     pub bridge: Arc<Mutex<BridgeServer>>,
 }
@@ -187,21 +191,17 @@ fn primary_top_center(win: &tauri::WebviewWindow, width: u32) -> Option<(f64, f6
     let mon_y = m.position().y as f64 / scale;
     let mon_w = m.size().width as f64 / scale;
     let x = (mon_x + (mon_w - width as f64) / 2.0).max(mon_x);
-    let panel_h = kde_panel_thickness() as f64; // already in X11/logical px (scale≈1)
+    let panel_h = kde_panel_thickness() as f64;
     let y = mon_y + panel_h;
     log::info!("primary_top_center: monitor={:?} scale={scale} x={x} y={y} panel_h={panel_h}", m.name());
     Some((x, y))
 }
 
 fn position_at_top(win: &tauri::WebviewWindow) {
-    let win_w = win.outer_size()
-        .map(|s| {
-            let scale = win.scale_factor().unwrap_or(1.0);
-            (s.width as f64 / scale).round() as u32
-        })
-        .unwrap_or(200);
-    if let Some((x, y)) = primary_top_center(win, win_w) {
-        log::info!("position_at_top: win_w={win_w} → x={x} y={y}");
+    // outer_size() is unreliable before win.show() on XWayland — use the
+    // known constant instead of querying the not-yet-mapped window.
+    if let Some((x, y)) = primary_top_center(win, PILL_WIDTH) {
+        log::info!("position_at_top: win_w={PILL_WIDTH} → x={x} y={y}");
         let _ = win.set_position(tauri::LogicalPosition::new(x, y));
     } else {
         log::warn!("position_at_top: primary monitor not found");

@@ -92,15 +92,32 @@
     hoverLeaveTimer = setTimeout(() => { isHovered = false; hoverLeaveTimer = null; }, 250);
   }
 
-  // ── ResizeObserver: measure rendered panel height ────────────────────────
+  // ── Panel height measurement ─────────────────────────────────────────────
+  // scrollHeight gives natural content height even when an ancestor constrains
+  // the rendered box; ResizeObserver still drives reactivity. Extra re-measures
+  // catch font-load reflow and post-transition settling.
   $effect(() => {
     if (!panelEl) return;
-    const ro = new ResizeObserver(entries => {
-      const h = Math.ceil(entries[0].contentRect.height);
-      panelHeight = Math.ceil(h / 4) * 4; // snap to 4px to suppress 1px churn
-    });
-    ro.observe(panelEl);
-    return () => ro.disconnect();
+    const el = panelEl;
+
+    const remeasure = () => {
+      const h = el.scrollHeight;
+      if (h > 0 && h !== panelHeight) {
+        panelHeight = h;
+      }
+    };
+
+    const ro = new ResizeObserver(remeasure);
+    ro.observe(el);
+    document.fonts?.ready.then(remeasure).catch(() => {});
+    const t1 = setTimeout(remeasure, 50);
+    const t2 = setTimeout(remeasure, 250);
+
+    return () => {
+      ro.disconnect();
+      clearTimeout(t1);
+      clearTimeout(t2);
+    };
   });
 
   // ── Window geometry: grow fast, shrink after close animation ────────────
@@ -717,27 +734,29 @@
     transform: rotate(180deg);
   }
 
-  /* ── Panel clip (overflow + transition) ─────────────────────────────────── */
+  /* ── Panel clip (fade + slide, no max-height) ───────────────────────────── */
+  /* max-height animation was removed: in WebKit2GTK it constrained .panel's
+     flex-stretched height to intermediate animation values, causing the
+     ResizeObserver to under-report panelHeight and the window to be sized
+     short. The window resize via set_window_geometry IS the reveal. */
   .panel-clip {
-    overflow: hidden;
-    max-height: 0;
     opacity: 0;
     transform: translateY(-8px);
     transition:
-      max-height 450ms var(--ease),
       opacity    300ms var(--ease),
       transform  400ms var(--ease);
-    margin-top: 0;
+    margin-top: 8px;
     width: 100%;
     display: flex;
     justify-content: center;
+    align-items: flex-start;
+    pointer-events: none;
   }
 
   .panel-clip-open {
-    max-height: 600px;
     opacity: 1;
     transform: translateY(0);
-    margin-top: 8px;
+    pointer-events: auto;
   }
 
   /* ── Panel shell ────────────────────────────────────────────────────────── */
@@ -747,6 +766,7 @@
     border-radius: 18px;
     overflow: hidden;
     box-shadow: 0 12px 32px rgba(0,0,0,0.65), 0 0 0 1px rgba(255,255,255,0.04) inset;
+    padding-bottom: 4px;
   }
 
   /* ── Condensed row ──────────────────────────────────────────────────────── */
