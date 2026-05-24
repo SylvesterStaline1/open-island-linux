@@ -2,8 +2,6 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
-use crate::bridge::server::BridgeServer;
-
 fn settings_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_default()
@@ -12,33 +10,31 @@ fn settings_path() -> PathBuf {
 }
 
 fn hook_binary_path() -> String {
-    // Look for hook-cli next to the app binary, or in PATH
+    // On Windows the binary has a .exe extension; on Unix it does not.
+    let name = if cfg!(windows) { "open-island-hook.exe" } else { "open-island-hook" };
+    // Prefer the sibling binary next to the app executable (installed layout).
     if let Ok(exe) = std::env::current_exe() {
-        let sibling = exe.parent().unwrap_or(std::path::Path::new("/usr/local/bin"))
-            .join("open-island-hook");
+        let sibling = exe.parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join(name);
         if sibling.exists() {
-            return sibling.to_string_lossy().to_string();
+            // Use forward slashes — works in cmd.exe, PowerShell, AND sh/bash on Windows.
+            return sibling.to_string_lossy().replace('\\', "/");
         }
     }
-    "open-island-hook".to_string()
-}
-
-fn socket_path_str() -> String {
-    BridgeServer::socket_path().to_string_lossy().to_string()
+    // Fall back to PATH lookup (dev/cargo run layout).
+    name.to_string()
 }
 
 fn make_hook_entry(event: &str) -> Value {
     // Claude Code format: { matcher: "", hooks: [{ type: "command", command: "..." }] }
+    // The hook reads the TCP port from the config file written by the bridge server,
+    // so no env var prefix is needed — and the command is the same on all platforms.
     json!({
         "matcher": "",
         "hooks": [{
             "type": "command",
-            "command": format!(
-                "OPEN_ISLAND_SOCKET_PATH={} {} {}",
-                socket_path_str(),
-                hook_binary_path(),
-                event
-            )
+            "command": format!("{} {}", hook_binary_path(), event)
         }]
     })
 }

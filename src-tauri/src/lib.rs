@@ -28,12 +28,13 @@ async fn get_sessions(state: tauri::State<'_, AppState>) -> Result<Vec<AgentSess
     Ok(bridge.sessions_snapshot().await)
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn resolve_permission(
     session_id: String,
     allow: bool,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
+    log::info!("resolve_permission: session_id={session_id} allow={allow}");
     let resolution = if allow {
         PermissionResolution::Allow
     } else {
@@ -41,6 +42,7 @@ async fn resolve_permission(
     };
     let bridge = state.bridge.lock().await;
     bridge.resolve_permission(session_id, resolution).await;
+    log::info!("resolve_permission: done");
     Ok(())
 }
 
@@ -56,22 +58,20 @@ async fn uninstall_hooks() -> Result<(), String> {
 
 #[tauri::command]
 async fn get_socket_path() -> String {
-    BridgeServer::socket_path().to_string_lossy().to_string()
+    BridgeServer::port_file_path().to_string_lossy().to_string()
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 async fn focus_session_terminal(session_id: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
     let bridge = state.bridge.lock().await;
     let sessions = bridge.sessions_snapshot().await;
-    let tty = sessions.into_iter()
-        .find(|s| s.session_id == session_id)
-        .and_then(|s| s.terminal_tty);
+    let session = sessions.into_iter().find(|s| s.session_id == session_id);
     drop(bridge);
 
-    let Some(tty) = tty else { return Ok(()) };
+    let Some(session) = session else { return Ok(()) };
 
     std::thread::spawn(move || {
-        focus_for_tty(&tty);
+        focus_session(&session);
     });
 
     Ok(())
@@ -167,7 +167,9 @@ pub fn run() {
 }
 
 /// Read the KDE panel thickness from plasmashellrc (KDE Wayland doesn't expose
-/// it via _NET_WORKAREA for XWayland clients).
+/// it via _NET_WORKAREA for XWayland clients). Linux-only; returns 0 elsewhere
+/// since Tauri's monitor APIs already account for the taskbar on Windows.
+#[cfg(target_os = "linux")]
 fn kde_panel_thickness() -> i32 {
     let home = std::env::var("HOME").unwrap_or_default();
     let path = std::path::Path::new(&home).join(".config/plasmashellrc");
@@ -180,6 +182,11 @@ fn kde_panel_thickness() -> i32 {
                 .and_then(|v| v.trim().parse::<i32>().ok())
         })
         .unwrap_or(0)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn kde_panel_thickness() -> i32 {
+    0
 }
 
 /// Returns (x, y) in logical px: centered on the primary monitor, just below its panel.
@@ -207,6 +214,8 @@ fn position_at_top(win: &tauri::WebviewWindow) {
         log::warn!("position_at_top: primary monitor not found");
     }
 }
+
+
 
 async fn forward_events(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<ServerEvent>,
@@ -257,16 +266,124 @@ fn update_tray_tooltip(app: &AppHandle, sessions: &[bridge::state::AgentSession]
     }
 }
 
-/// Dispatch to the platform implementation; no-op on unsupported platforms.
-#[cfg(target_os = "linux")]
-fn focus_for_tty(tty: &str) {
-    if let Some(pid) = find_terminal_pid_for_tty(tty) {
-        focus_window_by_pid(pid);
+fn focus_session(session: &AgentSession) {
+    #[cfg(target_os = "linux")]
+    if let Some(tty) = &session.terminal_tty {
+        if let Some(pid) = find_terminal_pid_for_tty(tty) {
+            focus_window_by_pid(pid);
+        }
+        return;
+    }
+
+    #[cfg(windows)]
+    focus_session_windows(session);
+
+    let _ = session; // suppress unused-variable warning on other platforms
+}
+
+#[cfg(windows)]
+fn focus_session_windows(session: &AgentSession) {
+    log::info!(
+        "focus_session_windows: hwnd={:?} app={:?} sid={}",
+        session.terminal_window_id,
+        session.terminal_app,
+        &session.session_id,
+    );
+    let Some(hwnd_str) = &session.terminal_window_id else {
+        log::warn!("focus_session_windows: no terminal_window_id — nothing to focus");
+        return;
+    };
+    let Ok(hwnd_val) = hwnd_str.parse::<isize>() else {
+        log::warn!("focus_session_windows: invalid hwnd '{hwnd_str}'");
+        return;
+    };
+
+    use windows::Win32::Foundation::{BOOL, HWND};
+    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId,
+        IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE,
+    };
+
+    let hwnd = HWND(hwnd_val as *mut core::ffi::c_void);
+    unsafe {
+        // AttachThreadInput trick: bypass Windows' foreground-window restriction.
+        // Overlay windows (alwaysOnTop + skipTaskbar) are not granted foreground
+        // rights by Windows, so plain SetForegroundWindow silently fails and only
+        // flashes the taskbar. Attaching our thread's input queue to both the
+        // current foreground thread and the target thread makes us share the same
+        // input context, which satisfies the restriction.
+        let target_tid = GetWindowThreadProcessId(hwnd, None);
+        let fg_tid     = GetWindowThreadProcessId(GetForegroundWindow(), None);
+        let our_tid    = GetCurrentThreadId();
+
+        let a1 = fg_tid != 0 && fg_tid != our_tid;
+        let a2 = target_tid != 0 && target_tid != our_tid && target_tid != fg_tid;
+        if a1 { let _ = AttachThreadInput(our_tid, fg_tid,     BOOL(1)); }
+        if a2 { let _ = AttachThreadInput(our_tid, target_tid, BOOL(1)); }
+
+        if IsIconic(hwnd).as_bool() { let _ = ShowWindow(hwnd, SW_RESTORE); }
+        let _ = BringWindowToTop(hwnd);
+        let _ = SetForegroundWindow(hwnd);
+        let _ = SetFocus(hwnd);
+
+        if a2 { let _ = AttachThreadInput(our_tid, target_tid, BOOL(0)); }
+        if a1 { let _ = AttachThreadInput(our_tid, fg_tid,     BOOL(0)); }
+    }
+    log::info!("focus_session_windows: focus dispatched for hwnd={hwnd_val}");
+
+    if session.terminal_app.as_deref() == Some("WindowsTerminal.exe") {
+        let token = format!("OI-{}", &session.session_id[..session.session_id.len().min(8)]);
+        if let Err(e) = select_wt_tab_by_title(&token, hwnd_val) {
+            log::debug!("UIA tab select: {e}");
+        }
     }
 }
 
-#[cfg(not(target_os = "linux"))]
-fn focus_for_tty(_tty: &str) {}
+#[cfg(windows)]
+fn select_wt_tab_by_title(token: &str, hwnd_val: isize) -> windows::core::Result<()> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};
+    use windows::Win32::UI::Accessibility::{
+        CUIAutomation8, IUIAutomation, IUIAutomationSelectionItemPattern,
+        TreeScope_Descendants, UIA_ControlTypePropertyId, UIA_SelectionItemPatternId,
+        UIA_TabItemControlTypeId,
+    };
+    use windows::core::{Interface, VARIANT};
+
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+
+        let automation: IUIAutomation =
+            CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER)?;
+
+        let hwnd = HWND(hwnd_val as *mut core::ffi::c_void);
+        let root = automation.ElementFromHandle(hwnd)?;
+
+        let variant = VARIANT::from(UIA_TabItemControlTypeId.0 as i32);
+        let condition =
+            automation.CreatePropertyCondition(UIA_ControlTypePropertyId, &variant)?;
+
+        let elements = root.FindAll(TreeScope_Descendants, &condition)?;
+        let count = elements.Length()?;
+
+        for i in 0..count {
+            let elem = elements.GetElement(i)?;
+            let name = elem.CurrentName()?.to_string();
+            if name.contains(token) {
+                let pattern: IUIAutomationSelectionItemPattern =
+                    elem.GetCurrentPattern(UIA_SelectionItemPatternId)?.cast()?;
+                pattern.Select()?;
+                log::debug!("UIA: activated tab '{name}'");
+                return Ok(());
+            }
+        }
+
+        log::debug!("UIA: no tab found containing '{token}' (tab title may have been overwritten)");
+        Ok(())
+    }
+}
 
 /// Walk /proc to find a terminal emulator whose child has the given controlling tty.
 #[cfg(target_os = "linux")]

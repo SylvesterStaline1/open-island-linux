@@ -28,6 +28,10 @@ pub struct AgentSession {
     pub pending_permission: Option<PendingPermission>,
     pub pending_question: Option<String>,
     pub terminal_tty: Option<String>,
+    pub terminal_window_id: Option<String>,
+    pub terminal_app: Option<String>,
+    pub terminal_session_id: Option<String>,
+    pub terminal_pid: Option<String>,
     pub started_at: f64,
     pub updated_at: f64,
 }
@@ -43,6 +47,10 @@ impl AgentSession {
             pending_permission: None,
             pending_question: None,
             terminal_tty: None,
+            terminal_window_id: None,
+            terminal_app: None,
+            terminal_session_id: None,
+            terminal_pid: None,
             started_at: timestamp,
             updated_at: timestamp,
         }

@@ -18,6 +18,11 @@
     summary: string | null;
     pending_permission: PendingPermission | null;
     pending_question: string | null;
+    terminal_tty: string | null;
+    terminal_window_id: string | null;
+    terminal_app: string | null;
+    terminal_session_id: string | null;
+    terminal_pid: string | null;
     started_at: number;
     updated_at: number;
   }
@@ -40,9 +45,11 @@
   let userExpanded = $state(false);
   let isHovered = $state(false);
   let hoverLeaveTimer: ReturnType<typeof setTimeout> | null = null;
+  let pillEl: HTMLDivElement | null = $state(null);
+  let pillWidth = $state(220);        // estimated until measured
   let panelEl: HTMLDivElement | null = $state(null);
   let panelHeight = $state(0);
-  let appliedHeight = $state(PILL_H);
+  let appliedHeight = $state(PILL_H - SLIVER_OFFSET);
   let unlisteners: UnlistenFn[] = [];
 
   const activeSessions = $derived(sessions.filter(s => s.phase !== "Completed"));
@@ -120,16 +127,31 @@
     };
   });
 
+  // ── Measure pill width so sliver mode can shrink window to fit ──────────
+  $effect(() => {
+    const el = pillEl;
+    if (!el) return;
+    const ro = new ResizeObserver(() => { pillWidth = el.getBoundingClientRect().width; });
+    ro.observe(el);
+    pillWidth = el.getBoundingClientRect().width;
+    return () => ro.disconnect();
+  });
+
   // ── Window geometry: grow fast, shrink after close animation ────────────
   $effect(() => {
-    const target = PILL_H + (userExpanded ? PANEL_GAP + panelHeight : 0);
-    if (target >= appliedHeight) {
-      appliedHeight = target;
-      invoke("set_window_geometry", { width: WIN_W, height: target }).catch(() => {});
+    const targetH = isSliver
+      ? PILL_H - SLIVER_OFFSET
+      : PILL_H + (userExpanded ? PANEL_GAP + panelHeight : 0);
+    const targetW = isSliver && pillWidth > 0
+      ? Math.ceil(pillWidth + 8)
+      : WIN_W;
+    if (targetH >= appliedHeight) {
+      appliedHeight = targetH;
+      invoke("set_window_geometry", { width: targetW, height: targetH }).catch(() => {});
     } else {
       const id = setTimeout(() => {
-        appliedHeight = target;
-        invoke("set_window_geometry", { width: WIN_W, height: target }).catch(() => {});
+        appliedHeight = targetH;
+        invoke("set_window_geometry", { width: targetW, height: targetH }).catch(() => {});
       }, 470);
       return () => clearTimeout(id);
     }
@@ -167,7 +189,21 @@
   }
 
   async function focusSession(sessionId: string) {
-    await invoke("focus_session_terminal", { sessionId }).catch(() => {});
+    await invoke("focus_session_terminal", { session_id: sessionId }).catch(() => {});
+  }
+
+  async function handlePermission(allow: boolean, sessionId: string) {
+    console.log("[OI] handlePermission clicked:", allow, sessionId);
+    try {
+      await invoke("resolve_permission", { session_id: sessionId, allow });
+      console.log("[OI] resolve_permission succeeded");
+      permissionEvent = null;
+      sessions = sessions.map(s =>
+        s.session_id === sessionId ? { ...s, phase: "Working", pending_permission: null } as Session : s
+      );
+    } catch (e) {
+      console.error("[OI] resolve_permission FAILED:", e);
+    }
   }
 
   // ── Helpers ──────────────────────────────────────────────────────────────
@@ -182,13 +218,22 @@
 
   function shortCwd(cwd: string | null): string {
     if (!cwd) return "~";
-    const parts = cwd.replace(/^\/home\/[^/]+/, "~").split("/");
+    // Normalize Windows backslashes, then strip home prefix on either platform.
+    const normalized = cwd.replace(/\\/g, "/");
+    const stripped = normalized
+      .replace(/^[A-Za-z]:\/[Uu]sers\/[^/]+/, "~")
+      .replace(/^\/home\/[^/]+/, "~");
+    const parts = stripped.split("/");
     return parts.slice(-2).join("/") || "~";
   }
 
   function shortPath(p: string | null | undefined): string {
     if (!p) return "";
-    const parts = (p as string).replace(/^\/home\/[^/]+/, "~").split("/");
+    const normalized = (p as string).replace(/\\/g, "/");
+    const stripped = normalized
+      .replace(/^[A-Za-z]:\/[Uu]sers\/[^/]+/, "~")
+      .replace(/^\/home\/[^/]+/, "~");
+    const parts = stripped.split("/");
     return parts.slice(-2).join("/") || p;
   }
 
@@ -377,36 +422,40 @@
   <div class="pill-row">
     <div
       class="pill"
+      bind:this={pillEl}
       role="button"
       tabindex="0"
       onclick={handlePillClick}
       onkeydown={(e) => e.key === "Enter" && handlePillClick()}
     >
-      <!-- Overlapping tool badges (urgent first, red + pulsing ring) -->
-      <div class="pill-badges">
-        {#each pillTopTools as t, i (i)}
-          <div class="badge-wrap" style="margin-left:{i === 0 ? 0 : -8}px; z-index:{pillTopTools.length - i};">
-            <div class="tool-badge tool-badge-26" class:tool-badge-red={isAwaiting && i === 0}>
-              {@html dotGlyph(TOOL_GLYPH_MAP[t] ?? "bash", 20, "#FFFFFF")}
+      <!-- In sliver mode: show nothing, keep pill clean. Only show badges/count/chevron when expanded/hovered. -->
+      {#if !isSliver}
+        <!-- Overlapping tool badges (urgent first, red + pulsing ring) -->
+        <div class="pill-badges">
+          {#each pillTopTools as t, i (i)}
+            <div class="badge-wrap" style="margin-left:{i === 0 ? 0 : -8}px; z-index:{pillTopTools.length - i};">
+              <div class="tool-badge tool-badge-26" class:tool-badge-red={isAwaiting && i === 0}>
+                {@html dotGlyph(TOOL_GLYPH_MAP[t] ?? "bash", 20, "#FFFFFF")}
+              </div>
+              {#if isAwaiting && i === 0}
+                <span class="ring-pulse"></span>
+              {/if}
             </div>
-            {#if isAwaiting && i === 0}
-              <span class="ring-pulse"></span>
-            {/if}
-          </div>
-        {/each}
-      </div>
+          {/each}
+        </div>
 
-      <!-- Agent count -->
-      {#if activeSessions.length > 0}
-        <span class="pill-count">{activeSessions.length}</span>
-        <!-- Separator -->
-        <span class="pill-sep"></span>
+        <!-- Agent count -->
+        {#if activeSessions.length > 0}
+          <span class="pill-count">{activeSessions.length}</span>
+          <!-- Separator -->
+          <span class="pill-sep"></span>
+        {/if}
+
+        <!-- Chevron (right side, rotates on expand) -->
+        <span class="pill-chevron" class:pill-chevron-up={userExpanded}>
+          {@html dotGlyph("chevronDown", 18, "var(--text-tertiary)")}
+        </span>
       {/if}
-
-      <!-- Chevron (right side, rotates on expand) -->
-      <span class="pill-chevron" class:pill-chevron-up={userExpanded}>
-        {@html dotGlyph("chevronDown", 18, "var(--text-tertiary)")}
-      </span>
     </div>
   </div>
 
@@ -460,16 +509,7 @@
           </div>
         {/if}
 
-        <!-- OPEN TERMINAL button (Linux) — Allow/Deny buttons go here on Windows (WriteConsoleInput) -->
-        <div class="action-row">
-          <button
-            class="btn-open-terminal"
-            onclick={() => focusSession(urgentSession!.session_id)}
-          >
-            OPEN TERMINAL &nbsp;·&nbsp; <span class="kbd">1</span> ALLOW &nbsp; <span class="kbd">2</span> DENY
-          </button>
-        </div>
-        <!-- Windows port: replace action-row above with Deny + Allow pill buttons:
+        <!-- Allow/Deny pill buttons + Open Terminal secondary -->
         <div class="action-row">
           <button class="btn-deny" onclick={() => handlePermission(false, urgentSession!.session_id)}>
             Deny <span class="kbd">2</span>
@@ -478,7 +518,14 @@
             Allow <span class="kbd">1</span>
           </button>
         </div>
-        -->
+        <div class="action-row action-row-secondary">
+          <button
+            class="btn-open-terminal"
+            onclick={() => focusSession(urgentSession!.session_id)}
+          >
+            OPEN TERMINAL
+          </button>
+        </div>
 
         <!-- Other sessions (dim) -->
         {#if otherSessions(urgentSession).length > 0}
@@ -954,21 +1001,37 @@
 
   .btn-open-terminal:hover { background: var(--nothing-red-hover); }
 
-  /* Windows port button styles (kept for reference):
   .btn-deny {
     flex: 1; height: 36px; border-radius: 10px; cursor: pointer;
     background: rgba(255,255,255,0.06); color: var(--text-primary);
     border: 1px solid var(--surface-3);
     display: flex; align-items: center; justify-content: center; gap: 8px;
     font-family: var(--font-body); font-size: 12.5px; font-weight: 500;
+    transition: background 150ms var(--ease);
   }
+  .btn-deny:hover { background: rgba(255,255,255,0.10); }
+
   .btn-allow {
     flex: 1; height: 36px; border-radius: 10px; border: 0; cursor: pointer;
     background: var(--nothing-red); color: var(--nothing-white);
     display: flex; align-items: center; justify-content: center; gap: 8px;
     font-family: var(--font-body); font-size: 12.5px; font-weight: 600;
+    transition: background 150ms var(--ease);
   }
-  */
+  .btn-allow:hover { background: var(--nothing-red-hover); }
+
+  .action-row-secondary {
+    padding-top: 0;
+  }
+  .action-row-secondary .btn-open-terminal {
+    background: rgba(255,255,255,0.04);
+    color: var(--text-secondary);
+    font-size: 10.5px;
+    height: 30px;
+  }
+  .action-row-secondary .btn-open-terminal:hover {
+    background: rgba(255,255,255,0.08);
+  }
 
   /* ── Hairline divider ───────────────────────────────────────────────────── */
   .hairline {

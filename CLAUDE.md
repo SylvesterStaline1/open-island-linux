@@ -1,75 +1,152 @@
-# Open Island Linux — Project Context
+# Open Island — Project Context
 
 ## What this is
-Linux port of Vibe Island (macOS-only). A floating pill overlay at the top of the screen (like the Mac Dynamic Island) that shows Claude Code agent status and lets the user approve/deny tool calls in real time.
+A floating pill overlay at the top of the screen (like the Mac Dynamic Island) that shows Claude Code agent status and lets the user approve/deny tool calls in real time.
 
-Built with **Tauri 2** (Rust backend + WebKit2GTK) and **Svelte 5** (frontend).
+Built with **Tauri 2** (Rust backend) and **Svelte 5** (frontend). Originally Linux-only; now being actively ported to **Windows** as the primary commercial platform.
 
 ## How to run
+
+### Windows (active development)
+```powershell
+cd C:\Users\wilan\documents\open-island-linux
+cargo tauri dev          # builds Rust + starts Svelte dev server, hot-reloads
+cargo tauri build        # release build
+```
+
+### Linux
 ```bash
 cd /home/sstaline/open-island-linux
-cargo tauri dev          # builds Rust + starts Svelte dev server
-# or build release:
-cargo tauri build
+cargo tauri dev
 ```
 
-The hooks binary is a separate crate:
+Hook relay binary (separate crate — rebuild after changes):
 ```bash
-cargo build -p open-island-hook   # rebuilds just the hook relay
+cargo build -p open-island-hook
 ```
 
-After building, install Claude hooks via the system tray → "Install Claude Hooks".
+Hooks are **auto-installed on every app launch** (idempotent). Manual reinstall: system tray → "Install Claude Hooks".
 
 ## Architecture
 
 ```
 open-island-linux/
-├── src/                    # Svelte 5 frontend
-│   └── App.svelte          # entire UI: pill bar, session list, permission dialog
+├── src/                        # Svelte 5 frontend
+│   └── App.svelte              # entire UI: pill bar, session list, permission/approval panels
 ├── src-tauri/src/
-│   ├── main.rs             # forces GDK_BACKEND=x11 before GTK init (XWayland fix)
-│   ├── lib.rs              # Tauri setup, commands, tray, window positioning
+│   ├── main.rs                 # Linux: forces GDK_BACKEND=x11 (XWayland fix)
+│   ├── lib.rs                  # Tauri setup, commands, tray, window positioning,
+│   │                           #   focus_session_terminal (Windows: AttachThreadInput + UIA)
 │   ├── bridge/
-│   │   ├── protocol.rs     # BridgeEnvelope / BridgeCommand / ClaudeHookPayload types
-│   │   ├── server.rs       # Unix socket server, session state machine, permission flow
-│   │   └── state.rs        # AgentSession, SessionPhase, BridgeState
+│   │   ├── protocol.rs         # BridgeEnvelope / BridgeCommand / ClaudeHookPayload types
+│   │   ├── server.rs           # TCP bridge server, session state machine, permission flow
+│   │   └── state.rs            # AgentSession, SessionPhase, BridgeState
 │   └── hooks/
-│       └── claude.rs       # install/uninstall hooks into ~/.claude/settings.json
-└── hook-cli/src/main.rs    # Standalone binary: Claude → socket → bridge relay
+│       └── claude.rs           # install/uninstall hooks into ~/.claude/settings.json
+└── hook-cli/src/main.rs        # Standalone binary: CC hook → TCP → bridge relay
+                                #   Windows: enriches payload with terminal HWND,
+                                #            sets WT tab title via OSC-0 at SessionStart
 ```
 
 ## Design constraints — OOTB (out-of-the-box)
 
-Open Island is intended for distribution to anyone. **Every feature must work on a clean Linux install with zero manual configuration by the user.** Specifically:
-- Do NOT require `ydotool`, `wmctrl`, `xdotool`, or any keyboard-injection tool.
-- Do NOT require `usermod -aG input`, `/dev/uinput` access, or `TIOCSTI`/sysctl changes.
-- Do NOT require shell rc edits, environment variable exports, or system daemons.
-- Hooks are auto-installed on every launch (idempotent). Hooks survive app restarts.
-- "Uninstall Hooks & Quit" is the only way to remove hooks — plain "Quit" leaves them intact.
-
-When proposing a new feature: if it needs any of the above, find an OOTB alternative first.
+Open Island is intended for distribution to anyone. **Every feature must work with zero manual configuration by the user.** Specifically:
+- Do NOT require external tools (ydotool, wmctrl, xdotool, xdg-open, etc.).
+- Do NOT require shell rc edits, env var exports, or system daemons.
+- Hooks auto-install on every launch. Hooks survive plain "Quit" (only "Uninstall Hooks & Quit" removes them).
+- On Windows: no elevated rights, no registry edits by the user, no WSL dependency.
 
 ## IPC flow
+
+### Windows
 1. Claude Code fires a hook (PreToolUse, PostToolUse, SessionStart, etc.)
-2. `open-island-hook <EventName>` binary is called with JSON payload on stdin
-3. The hook relay connects to the Unix socket and sends `BridgeEnvelope::Command { ProcessClaudeHook }`
-4. `BridgeServer` (in Tauri process) handles it, updates session state, emits `ServerEvent`
-5. `forward_events()` in lib.rs relays ServerEvents to the frontend via `app.emit()`
-6. For PreToolUse on gated tools: hook relay **blocks** waiting for a user decision from either:
-   - (a) A keypress on `/dev/tty` — the hook prints its own approval prompt and reads `y`/`n`
-   - (b) A `BridgeResponse::ClaudeHookDirective` pushed over the still-open socket when the user clicks Allow/Deny in the pill
-7. Whichever fires first wins. Hook writes `{"permissionDecision":"allow"|"deny"}` (or `"ask"` on 30s timeout) to stdout and exits.
-8. `resolve_permission` Tauri command → `ServerInner::resolve_permission` → sends on `pending_hook_decisions` oneshot → triggers path (b) above.
+2. `open-island-hook.exe <EventName>` is called with JSON payload on stdin
+3. Hook reads the TCP port from `%APPDATA%\open-island\port`
+4. Hook connects to `127.0.0.1:<port>` and sends `BridgeEnvelope::Command { ProcessClaudeHook }` (newline-delimited JSON)
+5. **Windows-only enrichment** (before sending): hook walks the process tree to find the terminal host (WindowsTerminal.exe etc.), captures its HWND, injects `terminal_window_id`, `terminal_app`, `terminal_pid`, `terminal_session_id` into the payload. At SessionStart under WT, also writes `OI-{8chars}` tab title via OSC-0 to CONOUT$.
+6. `BridgeServer` handles it, updates session state, emits `ServerEvent`
+7. `forward_events()` in lib.rs relays ServerEvents to the frontend via `app.emit()`
 
-**No keyboard injection, no wmctrl, no ydotool.** The hook owns both the tty prompt and the socket wait.
-
-## Unix socket
+### Linux
+Same flow but uses a **Unix socket** instead of TCP:
 - Path: `$OPEN_ISLAND_SOCKET_PATH` → `$VIBE_ISLAND_SOCKET_PATH` → `$XDG_RUNTIME_DIR/open-island/bridge.sock`
-- Default on this machine: `/run/user/1000/open-island/bridge.sock`
+- Default: `/run/user/1000/open-island/bridge.sock`
+
+### Permission flow (gated tools)
+For PreToolUse on gated tools (Bash, Edit, Write, etc.):
+- Hook returns `"ask"` to stdout → CC shows its native `1. Yes / 2. No` prompt in the terminal
+- **Linux**: hook polls `/dev/tty` for keypresses while connected to bridge (dual-channel wait via `poll()` on tty fd + socket fd)
+- **Windows**: hook spawns a keypress reader thread on `CONIN$` (raw console mode) while the main thread reads socket lines for directives. Whichever channel returns first wins — `allow`/`deny` decision returned to CC. Pill buttons emit `resolve_permission` → bridge sends `ClaudeHookDirective` back to the hook over the same TCP connection.
+
+## TCP bridge (Windows)
+
+- Port: written by bridge server to `%APPDATA%\open-island\port` on startup
+- Hook reads this file to find the port (no env var needed — zero config)
 - Protocol: newline-delimited JSON (`BridgeEnvelope` tagged union)
+- The bridge accepts multiple simultaneous connections (one per hook invocation)
+
+## Hook format in `~/.claude/settings.json`
+
+```json
+{
+  "PreToolUse": [
+    {
+      "matcher": "",
+      "hooks": [{ "type": "command", "command": "C:/path/to/open-island-hook.exe PreToolUse" }]
+    }
+  ]
+}
+```
+
+- The `matcher` wrapper is required — bare `{ "type": "command" }` objects are silently ignored by CC.
+- Hook event names from CC are PascalCase (`SessionStart`, not `sessionStart`). The server lowercases before matching.
+- Hook binary path uses **forward slashes** (works in cmd.exe, PowerShell, and sh/bash on Windows).
+- CC reads `settings.json` **once at process startup** — hooks only apply to CC sessions started after the app installs them.
+- Diagnostic log: `%TEMP%\oi-hook-log.txt` — append-only, one line per invocation, shows `ts=... event=... hwnd=... app=...`. Remove before release.
+
+## Files changed (2026-05-24 session)
+
+1. **`src/App.svelte`** — Added `handlePermission()` function, wired Allow/Deny buttons in permission panel, added `.btn-allow`, `.btn-deny`, `.action-row-secondary` styles. **Window sizing fix**: added `pillEl` ref + `pillWidth` state + `ResizeObserver` on `.pill` element; updated window geometry effect to compute `targetW` based on measured pill width in sliver mode (shrinks from 480px to ~pill-width + 8px); `appliedHeight` initialized to `PILL_H - SLIVER_OFFSET` (14px) instead of `PILL_H` (44px). **Clean sliver mode**: badges, count, and chevron are now hidden in sliver mode — only clean black pill shows.
+2. **`hook-cli/src/main.rs`** — Fixed `ConsoleModeGuard` to use `CONSOLE_MODE` type (matching `windows` crate 0.58`), removed duplicate `impl` blocks, fixed `HANDLE` `Send` issue by passing raw `isize` handle value to thread closure, added `use std::io::Write` for `set_tab_title`, fixed match patterns to use literal `u16` values instead of `b'x' as u16`.
+3. **`src-tauri/tauri.conf.json`** — Temporarily changed `beforeDevCommand` and `beforeBuildCommand` to `"echo skip"` to bypass pnpm/node_modules issues during development. Window config restored to original (removed `"shadow": false` that was added and then removed).
 
 ## Tools that block for approval (`requires_approval`)
 `Bash`, `Edit`, `Write`, `MultiEdit`, `NotebookEdit`, `WebFetch`, `WebSearch`, `computer_use`
+
+## Windows terminal focus (`focus_session_terminal`)
+
+When the user clicks a session row, the pill calls `focus_session_terminal(sessionId)` → Tauri command → spawns thread → `focus_session_windows(session)`.
+
+### How HWND is captured (hook-cli/src/main.rs — `win_terminal` mod)
+- Uses `CreateToolhelp32Snapshot` to build a PID→(PPID, name) map
+- Walks parent chain: hook → claude.exe → shell (skipped) → terminal host
+- **TERMINAL_APPS** (graphical hosts only — shells excluded): `WindowsTerminal.exe`, `OpenConsole.exe`, `conhost.exe`, `alacritty.exe`, `wezterm-gui.exe`, `mintty.exe`, `Hyper.exe`, `Tabby.exe`
+- Shells (`powershell.exe`, `cmd.exe`, `pwsh.exe`, etc.) are NOT in the list — they have no window
+- If parent-chain walk fails, fallback: look for `conhost.exe` child of the shell PID
+- `hwnd_for_pid()`: `EnumWindows` → first visible top-level window owned by that PID
+- Session stores: `terminal_window_id` (HWND as string), `terminal_app`, `terminal_pid`, `terminal_session_id` (WT_SESSION GUID)
+
+### How focus is applied (lib.rs — `focus_session_windows`)
+- Parses `terminal_window_id` as isize → HWND
+- **AttachThreadInput trick**: attaches our thread's input queue to both the current foreground thread AND the target window's thread — bypasses Windows' foreground-window restriction (overlay windows with `alwaysOnTop: true` are not granted foreground rights by default; `SetForegroundWindow` silently fails without this).
+- Calls `ShowWindow(SW_RESTORE)` + `BringWindowToTop` + `SetForegroundWindow` + `SetFocus`
+- Detaches thread input
+- For `WindowsTerminal.exe`: runs UIA tab selection (`select_wt_tab_by_title`) — finds the tab whose name contains `OI-{8chars}` token set at SessionStart, calls `SelectionItemPattern.Select()`
+
+### Windows crate features needed
+Both `src-tauri/Cargo.toml` and `hook-cli/Cargo.toml`:
+```toml
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",       # AttachThreadInput, GetCurrentThreadId, GetCurrentProcessId
+    "Win32_System_Diagnostics_ToolHelp",  # CreateToolhelp32Snapshot
+    "Win32_UI_WindowsAndMessaging", # HWND, EnumWindows, SetForegroundWindow, etc.
+    "Win32_UI_Input_KeyboardAndMouse",    # SetFocus
+    "Win32_System_Com",             # CoInitializeEx, CoCreateInstance
+    "Win32_UI_Accessibility",       # IUIAutomation, UIA_TabItemControlTypeId, etc.
+] }
+```
 
 ## Pill UI states
 
@@ -79,102 +156,122 @@ When proposing a new feature: if it needs any of the above, find an OOTB alterna
 | **Hover** | 480×44px | Mouse enters window (250ms debounce to collapse) |
 | **Expanded + sessions** | 480×(44 + 8 + panel_height)px | Click or urgent session — panel slides in below pill |
 
-- **Sliver** (idle, not hovered, not urgent): `.root` has `transform: translateY(-30px)`. Only the bottom 14px of the pill peeks below the KDE panel.
-- **Sliver always** when `!isHovered && !userExpanded && !isAwaiting` — even if working sessions exist (users hover to check).
-- **Hover** → `isHovered = true` → pill slides fully into view. 250ms debounce on mouse leave.
-- **Panel** (below pill): 480px wide, `#0A0A0A`, radius 18. Three variants: **session list** (default), **code approval** (tool awaiting permission), **question** (AskUserQuestion, dormant v1).
-- **Urgent** → auto-expands and holds open panel to the diff/question.
-- Pill is `inline-flex` content-sized (not full 480), centered in the window. Overlapping ToolBadges (size 26, `marginLeft:-8`). Urgent badge is index 0: red bg + `oi-ring` pulse. Chevron on the RIGHT, rotates 180° when expanded.
+- **Sliver**: `.root` has `transform: translateY(-30px)`. Only the bottom 14px of the pill peeks out.
+- `isSliver = $derived(!isHovered && !userExpanded && !isAwaiting)` — no active-count condition.
+- `urgentSession = $derived(activeSessions.find(s => s.pending_permission) ?? activeSessions.find(s => s.pending_question) ?? null)`
+- `isAwaiting = $derived(urgentSession !== null)`
+- `panelVariant = $derived(urgentSession?.pending_permission ? "code" : urgentSession?.pending_question ? "question" : "list")`
+- Hover handlers are on `.hover-wrapper` (outer, no transform) NOT on `.root` (transformed).
 - Easing: `cubic-bezier(0.2, 0, 0, 1)` everywhere (no spring).
 
 ## CSS constants (App.svelte)
-- `WIN_W = 480` — window width (always, even at sliver)
+- `WIN_W = 480` — window width (always)
 - `PILL_H = 44` — pill height
-- `SLIVER_OFFSET = 30` — translateY(-30) at rest → 14px of pill visible
+- `SLIVER_OFFSET = 30` — translateY(-30) at rest → 14px visible
 - `PANEL_GAP = 8` — gap between pill bottom and panel top
 - Pill background `#0A0A0A`, border-radius `0 0 12px 12px`, padding `0 16px`
 - Panel: `bg #0A0A0A, radius 18, shadow 0 12px 32px rgba(0,0,0,0.65)`
 
-## Sliver hover mechanic (important)
-- `isSliver = $derived(!isHovered && !userExpanded && !isAwaiting)` — no active-count condition; pill always rests at sliver unless urgent or explicitly expanded.
-- `urgentSession = $derived(activeSessions.find(s => s.pending_permission) ?? activeSessions.find(s => s.pending_question) ?? null)`
-- `isAwaiting = $derived(urgentSession !== null)`
-- `panelVariant = $derived(urgentSession?.pending_permission ? "code" : urgentSession?.pending_question ? "question" : "list")`
-- Hover handlers are on `.hover-wrapper` (outer, no transform) NOT on `.root` (transformed). CSS transforms shift pointer-event hit areas.
-- `.hover-wrapper` has no transform → its hit area is always the full window height → reliable mouseenter.
-
 ## Window / display
-- Window starts hidden, `"center": true` in tauri.conf.json for WM initial placement
-- **Key Tauri command**: `set_window_geometry(width, height)` — resizes AND recenters in one call. Called from `$effect` whenever `isExpanded` or session count changes. Does an immediate set_position + 80ms delayed retry.
-- **`primary_top_center(win, width)`** in lib.rs: computes (x, y) centered on the primary monitor, y = monitor_top + KDE panel height
-- **Panel height**: read from `~/.config/plasmashellrc` → `thickness=28`. `_NET_WORKAREA` does NOT work on this KDE Wayland + XWayland setup.
-- **KDE Wayland fix**: `GDK_BACKEND=x11` in `main.rs` forces XWayland so GTK honours `set_position`. Never remove this.
-- Always use `LogicalSize` / `LogicalPosition` — never PhysicalSize for window dimensions.
-- JS positioning removed from `onMount` — Rust is the single source of truth for window placement.
-- Startup sequence: `position_at_top` before `win.show()`, then 300ms delayed retry.
 
-## Multi-monitor setup (this machine)
-- External DP-2: 2496×1404 at global y=0 (top screen, NOT primary)
-- Laptop eDP-1: 1920×1200 at global y=1404 (PRIMARY — where pill lives)
-- `primary_monitor()` correctly returns eDP-1. Do NOT use "topmost by y" heuristic — that's the external monitor which the user does NOT want.
+### Windows
+- `alwaysOnTop: true, skipTaskbar: true, transparent: true, decorations: false` (tauri.conf.json)
+- Tauri monitor APIs (`primary_monitor()` + `LogicalSize`/`LogicalPosition`) handle positioning
+- No panel-detection needed (taskbar offset handled by Tauri on Windows)
+- `kde_panel_thickness()` returns 0 on non-Linux platforms
 
-## Hook format in ~/.claude/settings.json
-Claude Code expects:
-```json
-{
-  "PreToolUse": [
-    {
-      "matcher": "",
-      "hooks": [{ "type": "command", "command": "OPEN_ISLAND_SOCKET_PATH=... open-island-hook PreToolUse" }]
-    }
-  ]
+### Linux
+- `GDK_BACKEND=x11` in `main.rs` forces XWayland (never remove — GTK ignores `set_position` on Wayland)
+- **Panel height**: read from `~/.config/plasmashellrc` → `thickness=28`. `_NET_WORKAREA` doesn't work on KDE Wayland + XWayland.
+- Multi-monitor: external DP-2 (top, NOT primary), laptop eDP-1 (PRIMARY — pill goes here). Do NOT use "topmost by y" heuristic.
+
+## AgentSession fields (state.rs)
+
+```rust
+pub struct AgentSession {
+    pub session_id: String,
+    pub title: Option<String>,
+    pub cwd: Option<String>,
+    pub phase: SessionPhase,
+    pub summary: Option<String>,
+    pub pending_permission: Option<PendingPermission>,
+    pub pending_question: Option<String>,
+    pub terminal_tty: Option<String>,        // Linux: path to controlling tty
+    pub terminal_window_id: Option<String>,  // Windows: HWND as decimal string
+    pub terminal_app: Option<String>,        // Windows: "WindowsTerminal.exe" etc.
+    pub terminal_session_id: Option<String>, // Windows: WT_SESSION GUID
+    pub terminal_pid: Option<String>,        // Windows: terminal host PID
+    pub started_at: f64,
+    pub updated_at: f64,
 }
 ```
-The `matcher` wrapper is required — bare `{ "type": "command" }` objects are silently ignored.
-Hook event names from Claude Code are PascalCase (`SessionStart`, not `sessionStart`). The server lowercases before matching.
 
-## Current state (as of 2026-05-17)
-- Nothing DS redesign implemented: overlapping badges, oi-ring pulse, code-approval panel with diff snippet, question panel (dormant until backend wires AskUserQuestion).
-- Sessions appear correctly in the pill. Permission flow works end-to-end (hook-owns-both-UIs architecture).
-- Hooks auto-install on every app launch; they survive plain "Quit" (only "Uninstall Hooks & Quit" removes them).
-- `dangerouslySkipPermissions` is NOT set and NOT needed.
-- Sliver mode: pill rests at sliver (`translateY(-30)`, 14px visible) whenever not hovered/urgent. Hover → full expansion. Mouse leave (250ms debounce) → back to sliver.
-- Window is always 480px wide. Panel reveals below pill with `max-height/opacity/transform` transitions; window height grows immediately on open, shrinks after 470ms (after close animation).
-- Urgent permission → panel auto-opens to code-approval variant with `buildDiff` showing tool-specific content. **OPEN TERMINAL** button focuses the right terminal window. The two-button Deny/Allow row is commented out, labeled "Windows port: WriteConsoleInput".
-- **Pending**: Confirm pill positioned correctly on eDP-1 primary monitor just below the 28px KDE panel.
+`copy_terminal_fields` in `server.rs` updates these from each payload (SessionStart + PreToolUse events). Only updates a field if the payload value is `Some`.
 
 ## Dot-glyph system (App.svelte)
-- `TOOL_GLYPHS: Record<string, string>` — 12×12 grid strings (144 chars, '.' = empty, '#' = filled), stored as concatenated row strings (no whitespace stripping needed).
-- `dotGlyph(key, size, color)` — returns inline SVG string; use `{@html dotGlyph(...)}` in templates. Grid: 12×12 cells, cell=10px, r=3.25px (65% of cell).
+- `TOOL_GLYPHS: Record<string, string>` — 12×12 grid strings (144 chars, '.' = empty, '#' = filled).
+- `dotGlyph(key, size, color)` — returns inline SVG; use `{@html dotGlyph(...)}` in templates.
 - `TOOL_GLYPH_MAP` — maps `Bash`, `Edit`, `Write`, `MultiEdit`, `NotebookEdit`, `WebFetch`, `WebSearch`, `Read` to glyph keys.
-- `primaryGlyph` — derived: permission tool glyph > `'bash'` (active) > `'power'` (idle).
-- `sessionGlyph(s)` — per-session: pending_permission tool > `'check'` > `'bash'` > `'power'`.
-- Available glyph keys: `bash`, `edit`, `write`, `multiedit`, `notebook`, `webfetch`, `websearch`, `read`, `check`, `alert`, `power`, `question`, `chevronDown`, `chevronUp`, `close`, `play`.
-- Pulsing: wrap glyph `{@html ...}` in `<span class:pulsing={condition}>` — the `.pulsing` CSS class applies opacity animation.
+- Available keys: `bash`, `edit`, `write`, `multiedit`, `notebook`, `webfetch`, `websearch`, `read`, `check`, `alert`, `power`, `question`, `chevronDown`, `chevronUp`, `close`, `play`.
+- Pulsing: `<span class:pulsing={condition}>` with `.pulsing` CSS opacity animation.
 
-## Windows port plan
+## Current state (as of 2026-05-24)
 
-The app targets Windows as the commercial platform after Linux. Design decisions to keep in mind:
+**Windows port is the active development target.**
 
-- **IPC**: Unix socket → Windows named pipe `\\.\pipe\open-island`. Abstract `BridgeServer::socket_path()` behind a platform branch (`#[cfg(windows)]`) returning the pipe path. The hook relay connects to a named pipe instead.
-- **Allow/Deny**: On Linux the user presses `1`/`2` in the terminal (hook reads `/dev/tty`). On Windows, the hook uses `WriteConsoleInput` — unprivileged, targets the specific console by handle — to inject the keypress. This is OOTB on Windows (no elevated rights needed). The pill's Deny/Allow buttons are already stubbed in `App.svelte` (commented, labeled "Windows port: WriteConsoleInput").
-- **Permission flow on Windows**: The hook must hold the socket connection open while waiting for a pill decision (blocked on `pending_hook_decisions` oneshot channel). `server.rs:292` has a comment marking exactly where to re-add the socket-hold block.
-- **Window positioning**: `GDK_BACKEND=x11` and `plasmashellrc` panel detection are Linux-only. On Windows, use `MonitorFromWindow` / `GetMonitorInfo` via Tauri's monitor APIs — same `primary_monitor()` + `LogicalSize`/`LogicalPosition` pattern works cross-platform.
-- **`#[cfg]` strategy**: Use `#[cfg(target_os = "linux")]` / `#[cfg(windows)]` branches rather than runtime checks. Keep the shared logic (session state, IPC protocol, UI) fully platform-agnostic.
+- Sessions appear in the pill for real Claude Code sessions (hooks fire, bridge stores state).
+- Hook auto-installs on every launch, survives plain "Quit".
+- IPC via TCP works (hook reads port from `%APPDATA%/open-island/port`).
+- Hook enriches payload with terminal HWND (`terminal_window_id`) + app name (`terminal_app`).
+- Clicking a session row attempts `SetForegroundWindow` + UIA tab select via `OI-{8chars}` tab title token.
+- AttachThreadInput fix applied (2026-05-23) to bypass overlay foreground restriction.
+- UIA tab select uses `OI-{session_id[..8]}` token written at SessionStart via OSC-0 to CONOUT$.
+- **Phase 1.5 IMPLEMENTED (2026-05-24) — UNTESTED**: Pill Allow/Deny buttons wired on Windows. Frontend has `handlePermission(allow, sessionId)` → invokes `resolve_permission` Tauri command → bridge resolves the oneshot channel → hook receives `ClaudeHookDirective` via TCP and returns `allow`/`deny` to Claude Code. Console keypress fallback (`y/n/1/2/Esc`) still works. **Requires real Claude Code session to verify end-to-end.**
+- **hook-cli compilation fixed (2026-05-24)**: Fixed `ConsoleModeGuard` type mismatches with `windows` crate 0.58 (`CONSOLE_MODE` vs raw `u32`), removed duplicate `impl` blocks, fixed `HANDLE` `Send` issue in `spawn_keypress_reader` by passing raw `isize` handle value to the thread closure.
+- **Sliver mode window sizing fixed (2026-05-24)**: Window now dynamically shrinks to match the actual pill dimensions in sliver mode — **14px height** (was 44px) and **pill-width + 8px** (was 480px). This eliminates transparent dead space that was blocking clicks and triggering false hovers. Uses `ResizeObserver` on the `.pill` element + `set_window_geometry` to resize and recenter. **Tested visually — works.**
+- **Clean sliver mode (2026-05-24)**: In sliver mode, badges, agent count, and chevron are now completely hidden — only the clean black pill background shows. This prevents the purple tool badge from bleeding outside the pill bounds.
+- **Sliver mode window sizing fixed (2026-05-24)**: Window now dynamically shrinks to match the actual pill dimensions in sliver mode — **14px height** (was 44px) and **pill-width + 8px** (was 480px). This eliminates transparent dead space that was blocking clicks and triggering false hovers. Uses `ResizeObserver` on the `.pill` element + `set_window_geometry` to resize and recenter. **Tested visually — works.**
+- **Pending / deferred**: ConPTY-conhost edge case for sessions without HWND.
+- **Pending / deferred**: ConPTY-conhost edge case for sessions without HWND.
+
+**Linux** (lower priority, still works):
+- Sliver/hover/expand/session-list/permission flow all working.
+- Pill positions correctly on eDP-1 below 28px KDE panel.
 
 ## Known issues / gotchas
-- `_NET_WORKAREA` returns y=0 on KDE Wayland + XWayland — useless for panel detection. Use `~/.config/plasmashellrc` `thickness=` instead.
-- `current_monitor()` returns None when called before the WM maps the window — use `primary_monitor()` instead.
+
+### Windows
+- `SetForegroundWindow` silently fails from overlay windows without `AttachThreadInput` — Windows flashes the taskbar instead of activating the target window.
+- `AttachThreadInput` is in `windows::Win32::System::Threading` (NOT `Win32::UI::WindowsAndMessaging` as MSDN placement might suggest).
+- `SetFocus` is in `windows::Win32::UI::Input::KeyboardAndMouse`.
+- Shells (`powershell.exe`, `cmd.exe`) must NOT be in TERMINAL_APPS — they have no window; the walk must continue past them to find `WindowsTerminal.exe`.
+- `conhost.exe` found via the fallback (child of shell) may be a ConPTY with no visible window → `hwnd_for_pid` returns None; those sessions have no HWND and click is a no-op.
+- CC reads `settings.json` once at startup — hooks only apply to new CC sessions after hooks are installed.
+- Hook log `%TEMP%\oi-hook-log.txt` is a debug artifact — remove before release.
+
+### Linux
+- `_NET_WORKAREA` returns y=0 on KDE Wayland + XWayland — useless for panel detection.
+- `current_monitor()` returns None before WM maps the window — use `primary_monitor()`.
 - `set_size(PhysicalSize(w, h))` on a 2x display creates a half-logical-pixel window — always use `LogicalSize`.
-- Terminal may be left in raw mode after a Tauri panic — run `reset` to fix.
-- `win.outer_size()` is unreliable before `win.show()` — XWayland reports stale/wrong values on the unmapped window. Use the `PILL_WIDTH` constant in `lib.rs` (or pass the known width explicitly) rather than querying at startup.
-- XWayland doubles all X11 window coordinates when reported back via wmctrl (e.g. `set_position(LogicalPosition(720,28))` → wmctrl shows `(1440,56)`). This is correct and expected — the visual position IS centered; the doubling is XWayland's coordinate mapping. Do NOT compensate for this by halving the computed position; that breaks centering. The formula `x = (mon_w - width) / 2` producing `x=720` → wmctrl `1440` → visually centered is intentional.
-- The user has two monitors: external DP-2 (top, NOT primary) and laptop eDP-1 (bottom, PRIMARY). The pill goes on eDP-1. Do NOT switch to a "topmost monitor" heuristic.
-- `set_window_geometry` spawns a delayed 80ms repositioning task — do not call it in a tight loop.
-- `.panel-clip` does NOT use `max-height` animation. In WebKit2GTK, animating `max-height` on a flex container constrained `.panel` (flex child) to the intermediate animation value, causing ResizeObserver to under-report panel height, which caused the window to be sized too short and clip content. The fix: remove `max-height` entirely from `.panel-clip`; use only `opacity` + `transform` for visual animation. The window resize via `set_window_geometry` IS the reveal — the body's `overflow: hidden` clips the full-height panel when the window is small.
+- XWayland doubles X11 coordinates in wmctrl output (visual position is still correct — do NOT halve).
+- `set_window_geometry` spawns a delayed 80ms retry — do not call in a tight loop.
+- `.panel-clip` must NOT animate `max-height` (breaks ResizeObserver in WebKit2GTK) — use only `opacity` + `transform`.
 
 ## Svelte 5 notes
 - Uses rune API: `$state`, `$derived`, `$effect`
-- `mount()` from `svelte` (not `new App()`) — vite.config.ts has `resolve: { conditions: ["browser", ...] }`
+- `mount()` from `svelte` (not `new App()`)
 - `$effect` runs before `onMount` in the first render cycle
-- Effects CAN set `$state` variables (e.g. auto-expanding on permission) without loops if the state change doesn't re-trigger the effect's dependencies
+- Effects CAN set `$state` variables without loops if the change doesn't re-trigger the effect's dependencies
+
+## Windows port — remaining work
+
+- **Installer**: NSIS installer via `cargo tauri build` (already configured in tauri.conf.json).
+- **Taskbar positioning**: Currently using `primary_monitor()` — confirm pill lands just below Windows taskbar.
+
+## Development environment notes (Windows)
+
+- **PATH requirements**: Must have `C:\Users\wilan\.cargo\bin` (for cargo) and `C:\Users\wilan\AppData\Roaming\npm` (for pnpm) in PATH.
+- **pnpm/node_modules issues**: If `pnpm dev` fails with "Cannot find module", dependencies may need reinstall (`rm -rf node_modules && pnpm install`).
+- **Workaround for dev server issues**: If `cargo tauri dev` fails due to missing pnpm/node, use `--no-dev-server` flag with a pre-built `dist` folder, or temporarily change `beforeDevCommand` in `tauri.conf.json` to `"echo skip"`.
+- **Alternative dev server**: Can serve `dist/` folder on port 5173 with `npx serve -l 5173` or Python http.server.
+- **tauri.conf.json changes made 2026-05-24**: `beforeDevCommand` and `beforeBuildCommand` temporarily changed to `"echo skip"` to bypass pnpm issues during development.

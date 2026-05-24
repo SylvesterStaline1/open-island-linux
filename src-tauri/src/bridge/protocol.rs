@@ -76,6 +76,8 @@ pub struct ClaudeHookPayload {
     pub terminal_tty: Option<String>,
     pub terminal_session_id: Option<String>,
     pub terminal_title: Option<String>,
+    pub terminal_window_id: Option<String>,
+    pub terminal_pid: Option<String>,
     pub model: Option<String>,
     pub is_interrupt: Option<bool>,
 }

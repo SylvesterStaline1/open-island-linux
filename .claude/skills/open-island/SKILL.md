@@ -1,26 +1,28 @@
 ---
 name: open-island
-description: Use this skill when the user says "/open-island", wants to continue working on the Open Island Linux app, or references the floating pill overlay / Claude Code agent status app. Loads full project context and orients Claude for development.
-version: 1.2.0
+description: Use this skill when the user says "/open-island", wants to continue working on the Open Island app, or references the floating pill overlay / Claude Code agent status app. Loads full project context and orients Claude for development.
+version: 1.3.0
 argument-hint: [feature description or issue to work on]
 ---
 
 # Open Island — Development Context Loader
 
-Open Island is a Tauri 2 + Svelte 5 app: a floating pill overlay at the top of the screen (like the Mac Dynamic Island) that shows Claude Code agent status in real time and lets the user approve/deny tool calls. Targets Linux now, Windows commercially.
+Open Island is a Tauri 2 + Svelte 5 floating pill overlay that shows Claude Code agent status in real time and lets the user approve/deny tool calls. **Windows is the active commercial target** (Linux port also maintained).
 
 ---
 
 ## On invocation
 
-1. **Read `CLAUDE.md`** in the project root — it is the authoritative source of architecture, file map, IPC flow, known issues, current state, and Windows port plan.
+1. **Read `CLAUDE.md`** in the project root — authoritative source for architecture, IPC flow, Windows focus implementation, known issues, and current state.
 
-2. **Read the relevant source files** for the task at hand (paths relative to project root):
+2. **Read the relevant source files** for the task at hand:
    - UI: `src/App.svelte`
-   - Tauri backend: `src-tauri/src/lib.rs`
+   - Tauri backend: `src-tauri/src/lib.rs` (commands, tray, window positioning, focus logic)
    - Bridge server: `src-tauri/src/bridge/server.rs`
+   - Bridge protocol/state: `src-tauri/src/bridge/protocol.rs`, `src-tauri/src/bridge/state.rs`
    - Hook install: `src-tauri/src/hooks/claude.rs`
-   - Hook relay binary: `hook-cli/src/main.rs`
+   - Hook relay binary: `hook-cli/src/main.rs` (Windows: terminal HWND enrichment + OSC-0 tab title)
+   - Tauri config: `src-tauri/tauri.conf.json`
 
 3. **Check `~/.claude/settings.json`** if the issue relates to hooks or permissions.
 
@@ -40,21 +42,34 @@ Open Island is a Tauri 2 + Svelte 5 app: a floating pill overlay at the top of t
 | Hook relay | `hook-cli/src/main.rs` |
 | Tauri config | `src-tauri/tauri.conf.json` |
 | Claude settings | `~/.claude/settings.json` |
-| Socket (runtime) | `$XDG_RUNTIME_DIR/open-island/bridge.sock` |
+| TCP port file (Windows) | `%APPDATA%\open-island\port` |
+| Hook diagnostic log | `%TEMP%\oi-hook-log.txt` |
+| Unix socket (Linux) | `$XDG_RUNTIME_DIR/open-island/bridge.sock` |
 
 ---
 
 ## Dev workflow
 
-```bash
-cargo tauri dev          # watches both Rust and Svelte, hot-reloads frontend
+```powershell
+# Windows (primary)
+cargo tauri dev          # hot-reloads Rust + Svelte
+cargo build -p open-island-hook   # rebuild hook relay only
 ```
 
-Rust changes auto-recompile in dev mode. If the app seems stuck on an old binary, kill and restart `cargo tauri dev`.
-
-Hook relay only:
 ```bash
-cargo build -p open-island-hook
+# Linux
+cargo tauri dev
 ```
 
-After building, hooks are auto-installed on every app launch (idempotent). Manual install: system tray → "Install Claude Hooks".
+Hooks auto-install on every app launch (idempotent). If the app seems stuck on an old binary, kill it (Stop-Process / kill), kill any node holding port 5173, then re-run `cargo tauri dev`.
+
+---
+
+## Key Windows-specific facts
+
+- **IPC**: TCP (`127.0.0.1:<port>`), not Unix socket. Port written to `%APPDATA%\open-island\port`.
+- **Hook path**: `open-island-hook.exe`; installed with forward slashes in settings.json.
+- **Terminal focus**: Hook captures terminal HWND via process-tree walk (skips shells, finds `WindowsTerminal.exe` etc.). `focus_session_windows` in lib.rs uses **AttachThreadInput** to bypass overlay foreground restriction, then `SetForegroundWindow` + UIA tab select.
+- **UIA tab matching**: Hook writes `OI-{session_id[..8]}` as WT tab title at SessionStart via OSC-0 escape to CONOUT$. Click matches tab by that token.
+- **OOTB constraint**: No external tools, no elevated rights, no manual steps — must work for any end user.
+- **windows crate 0.58**: `AttachThreadInput` → `Win32::System::Threading`; `SetFocus` → `Win32::UI::Input::KeyboardAndMouse`; NOT in `Win32::UI::WindowsAndMessaging`.

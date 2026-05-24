@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use uuid::Uuid;
 
@@ -28,6 +28,14 @@ pub enum ServerEvent {
         title: Option<String>,
         message: String,
     },
+}
+
+fn copy_terminal_fields(session: &mut super::state::AgentSession, payload: &ClaudeHookPayload) {
+    if payload.terminal_tty.is_some() { session.terminal_tty = payload.terminal_tty.clone(); }
+    if payload.terminal_window_id.is_some() { session.terminal_window_id = payload.terminal_window_id.clone(); }
+    if payload.terminal_app.is_some() { session.terminal_app = payload.terminal_app.clone(); }
+    if payload.terminal_session_id.is_some() { session.terminal_session_id = payload.terminal_session_id.clone(); }
+    if payload.terminal_pid.is_some() { session.terminal_pid = payload.terminal_pid.clone(); }
 }
 
 pub(crate) struct ServerInner {
@@ -58,7 +66,9 @@ impl ServerInner {
         let event = payload.hook_event_name.to_lowercase();
         match event.as_str() {
             "sessionstart" => {
-                self.state.get_or_create(&sid, payload.cwd.clone(), None, ts);
+                log::debug!("SessionStart: sid={sid}");
+                let session = self.state.get_or_create(&sid, payload.cwd.clone(), None, ts);
+                copy_terminal_fields(session, &payload);
                 self.emit_snapshot();
             }
 
@@ -71,10 +81,7 @@ impl ServerInner {
                 let session = self.state.get_or_create(&sid, payload.cwd.clone(), None, ts);
                 session.updated_at = ts;
 
-                // Store the terminal tty so pill-side Allow/Deny can target the right window
-                if payload.terminal_tty.is_some() {
-                    session.terminal_tty = payload.terminal_tty.clone();
-                }
+                copy_terminal_fields(session, &payload);
 
                 if needs_approval {
                     session.phase = SessionPhase::AwaitingPermission;
@@ -147,10 +154,13 @@ impl ServerInner {
     }
 
     fn resolve_permission(&mut self, session_id: &str, resolution: PermissionResolution) {
+        let found = self.pending_hook_decisions.contains_key(session_id);
+        log::info!("resolve_permission: session_id={session_id} found_pending={found}");
         // Push the decision to the hook that is blocking on the socket.
         // If the hook already resolved via tty, the send fails silently — that's fine.
         if let Some(tx) = self.pending_hook_decisions.remove(session_id) {
-            let _ = tx.send(resolution);
+            let send_ok = tx.send(resolution).is_ok();
+            log::info!("resolve_permission: oneshot send_ok={send_ok}");
         }
 
         if let Some(session) = self.state.sessions.get_mut(session_id) {
@@ -181,29 +191,25 @@ impl BridgeServer {
         }
     }
 
-    pub fn socket_path() -> PathBuf {
-        if let Ok(p) = std::env::var("OPEN_ISLAND_SOCKET_PATH") {
-            return PathBuf::from(p);
-        }
-        if let Ok(p) = std::env::var("VIBE_ISLAND_SOCKET_PATH") {
-            return PathBuf::from(p);
-        }
-        let base = dirs::runtime_dir()
-            .or_else(|| dirs::data_local_dir())
-            .unwrap_or_else(|| PathBuf::from("/tmp"));
-        base.join("open-island").join("bridge.sock")
+    /// Returns the path where the TCP port number is stored.
+    /// Linux: ~/.config/open-island/port  |  Windows: %APPDATA%/open-island/port
+    pub fn port_file_path() -> PathBuf {
+        dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("open-island")
+            .join("port")
     }
 
-    pub(crate) async fn listen(inner: Arc<Mutex<ServerInner>>, socket_path: PathBuf) -> Result<()> {
-        if socket_path.exists() {
-            std::fs::remove_file(&socket_path)?;
-        }
-        if let Some(parent) = socket_path.parent() {
+    pub(crate) async fn listen(inner: Arc<Mutex<ServerInner>>) -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+
+        let port_path = Self::port_file_path();
+        if let Some(parent) = port_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-
-        let listener = UnixListener::bind(&socket_path)?;
-        log::info!("Bridge server listening on {:?}", socket_path);
+        std::fs::write(&port_path, port.to_string())?;
+        log::info!("Bridge server listening on 127.0.0.1:{} (port file: {:?})", port, port_path);
 
         loop {
             match listener.accept().await {
@@ -221,9 +227,8 @@ impl BridgeServer {
     }
 
     pub async fn start(&mut self) -> Result<()> {
-        let path = Self::socket_path();
         let inner = self.inner.clone();
-        tokio::spawn(Self::listen(inner, path));
+        tokio::spawn(Self::listen(inner));
         Ok(())
     }
 
@@ -238,7 +243,7 @@ impl BridgeServer {
     }
 }
 
-async fn handle_client(stream: UnixStream, inner: Arc<Mutex<ServerInner>>) -> Result<()> {
+async fn handle_client(stream: TcpStream, inner: Arc<Mutex<ServerInner>>) -> Result<()> {
     let client_id = Uuid::new_v4().to_string();
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut lines = BufReader::new(read_half).lines();
@@ -265,6 +270,7 @@ async fn handle_client(stream: UnixStream, inner: Arc<Mutex<ServerInner>>) -> Re
                 continue;
             }
         };
+        log::debug!("[{}] received envelope ({}b)", client_id, line.len());
 
         let ack = serde_json::to_string(&BridgeEnvelope::Response {
             response: BridgeResponse::Acknowledged,
@@ -282,15 +288,54 @@ async fn handle_client(stream: UnixStream, inner: Arc<Mutex<ServerInner>>) -> Re
                     }
 
                     BridgeCommand::ProcessClaudeHook { claude_hook } => {
-                        {
+                        let sid = claude_hook.session_id.clone();
+                        let needs_wait = {
                             let mut guard = inner.lock().await;
                             guard.handle_claude_hook(claude_hook);
-                        }
+                            guard
+                                .state
+                                .sessions
+                                .get(&sid)
+                                .map(|s| s.pending_permission.is_some())
+                                .unwrap_or(false)
+                        };
                         resp_tx.send(ack)?;
-                        // Windows port: re-add the socket-hold block here so resolve_permission
-                        // can push a ClaudeHookDirective back to the hook for WriteConsoleInput.
-                        // See project_open_island_crossplatform memory and pending_hook_decisions
-                        // in ServerInner (preserved for this purpose).
+
+                        if needs_wait {
+                            let (tx, rx) = oneshot::channel::<PermissionResolution>();
+                            {
+                                let mut guard = inner.lock().await;
+                                guard.pending_hook_decisions.insert(sid.clone(), tx);
+                            }
+                            let resp_tx_clone = resp_tx.clone();
+                            let inner_clone   = inner.clone();
+                            let sid_clone     = sid.clone();
+                            tokio::spawn(async move {
+                                let r = tokio::time::timeout(Duration::from_secs(30), rx).await;
+                                log::info!("hook-decision task: rx received={}", r.is_ok());
+                                if let Ok(Ok(resolution)) = r {
+                                    let directive = match resolution {
+                                        PermissionResolution::Allow =>
+                                            ClaudeHookDirective::Allow,
+                                        PermissionResolution::Deny { message } =>
+                                            ClaudeHookDirective::Deny { message },
+                                    };
+                                    if let Ok(line) = serde_json::to_string(
+                                        &BridgeEnvelope::Response {
+                                            response: BridgeResponse::ClaudeHookDirective {
+                                                directive,
+                                            },
+                                        },
+                                    ) {
+                                        log::info!("hook-decision task: sending directive line len={}", line.len());
+                                        let send_ok = resp_tx_clone.send(line).is_ok();
+                                        log::info!("hook-decision task: resp_tx send_ok={send_ok}");
+                                    }
+                                }
+                                let mut guard = inner_clone.lock().await;
+                                guard.pending_hook_decisions.remove(&sid_clone);
+                            });
+                        }
                     }
 
                     BridgeCommand::ResolvePermission { session_id, resolution } => {
