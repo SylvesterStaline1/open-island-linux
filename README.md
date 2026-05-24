@@ -1,12 +1,12 @@
 # Claude Island
 
-> Manage all your Claude Code terminals in one place — and know the moment one wants to run something it probably shouldn't.
+> Manage all your Claude Code sessions in one place — tap Allow or Deny when one asks for permission.
 
 ![demo](./assets/demo.gif)
 
 A floating pill at the top of your screen. Shows every Claude Code session you've got running, what they're up to, and lets you Allow/Deny tool calls without leaving your current window.
 
-Think Dynamic Island, but for the agents quietly editing your codebase while you make coffee.
+A floating pill that lives quietly at the top of your screen and lights up when an agent needs your attention.
 
 ---
 
