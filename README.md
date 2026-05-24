@@ -10,6 +10,10 @@ A floating pill that lives quietly at the top of your screen and lights up when 
 
 ---
 
+![architecture](./assets/architecture.svg)
+
+---
+
 ## What it does
 
 - **One pill, all your agents.** See every active Claude Code session at a glance.
