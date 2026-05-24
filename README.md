@@ -24,7 +24,7 @@ Think Dynamic Island, but for the agents quietly editing your codebase while you
 ### Windows
 
 ```powershell
-git clone https://github.com/SylvesterStaline1/open-island-linux
+git clone https://github.com/william-bossut/open-island-linux
 cd open-island-linux
 pnpm install
 cargo tauri dev    # dev — hot reload

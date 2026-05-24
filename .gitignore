@@ -19,3 +19,11 @@ src-tauri/target/
 # OS
 .DS_Store
 Thumbs.db
+
+# Internal / private
+STRATEGY.md
+LAUNCH_CHECKLIST.md
+CLAUDE.md
+.claude/
+design/
+assets/palette.png
