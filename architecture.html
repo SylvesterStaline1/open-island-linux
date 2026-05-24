@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Claude Island — Architecture</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;700&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --surface-0:      #000000;
+      --surface-1:      #121212;
+      --surface-2:      #1F1F1F;
+      --surface-3:      #2B2B2B;
+      --text-primary:   #FFFFFF;
+      --text-secondary: #BFBFBF;
+      --text-tertiary:  #7A7A7A;
+      --text-disabled:  #3D3D3D;
+      --divider:        #2B2B2B;
+      --nothing-red:    #D81F26;
+    }
+
+    body {
+      font-family: 'JetBrains Mono', 'Courier New', monospace;
+      background: var(--surface-0);
+      background-image: radial-gradient(circle, #181818 1px, transparent 1px);
+      background-size: 20px 20px;
+      color: var(--text-primary);
+      padding: 64px 52px 80px;
+      min-height: 100vh;
+    }
+
+    /* ── HEADER ─────────────────────────────────── */
+    .header { margin-bottom: 60px; }
+
+    .eyebrow {
+      font-size: 9px;
+      letter-spacing: 0.25em;
+      color: var(--text-disabled);
+      text-transform: uppercase;
+      margin-bottom: 14px;
+    }
+
+    h1 {
+      font-size: 38px;
+      font-weight: 700;
+      letter-spacing: -0.04em;
+      line-height: 1;
+      margin-bottom: 10px;
+    }
+
+    .subhead {
+      font-size: 11px;
+      font-weight: 300;
+      color: var(--text-tertiary);
+      letter-spacing: 0.03em;
+    }
+
+    .dot-row {
+      display: flex;
+      gap: 5px;
+      margin-top: 32px;
+    }
+
+    .dot {
+      width: 3px; height: 3px;
+      background: var(--text-disabled);
+      border-radius: 50%;
+    }
+
+    /* ── SECTION ────────────────────────────────── */
+    .section { margin-bottom: 60px; }
+
+    .section-label {
+      font-size: 9px;
+      letter-spacing: 0.22em;
+      color: var(--text-disabled);
+      text-transform: uppercase;
+      padding-bottom: 14px;
+      margin-bottom: 22px;
+      border-bottom: 1px solid var(--divider);
+    }
+
+    /* ── FLOW SVG WRAPPER ───────────────────────── */
+    .flow-wrap { overflow-x: auto; }
+    .flow-wrap svg { min-width: 880px; width: 100%; }
+
+    /* ── COMPONENT CARDS ────────────────────────── */
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 10px;
+    }
+
+    .card {
+      background: var(--surface-1);
+      border: 1px solid var(--divider);
+      border-radius: 6px;
+      padding: 18px 16px 20px;
+    }
+
+    .card-num {
+      font-size: 8px;
+      letter-spacing: 0.2em;
+      color: var(--text-disabled);
+      margin-bottom: 10px;
+    }
+
+    .card-name {
+      font-size: 13px;
+      font-weight: 700;
+      margin-bottom: 3px;
+    }
+
+    .card-path {
+      font-size: 9px;
+      color: var(--text-tertiary);
+      margin-bottom: 14px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--divider);
+    }
+
+    .card-glyph {
+      margin-bottom: 14px;
+    }
+
+    .card-list {
+      list-style: none;
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+    }
+
+    .card-list li {
+      font-size: 10px;
+      color: var(--text-secondary);
+      padding-left: 14px;
+      position: relative;
+      line-height: 1.5;
+    }
+
+    .card-list li::before {
+      content: '·';
+      position: absolute;
+      left: 2px;
+      color: var(--text-disabled);
+    }
+
+    /* ── SESSION STATES ─────────────────────────── */
+    .states {
+      display: flex;
+      align-items: stretch;
+      background: var(--surface-1);
+      border: 1px solid var(--divider);
+      border-radius: 6px;
+      overflow: hidden;
+    }
+
+    .state {
+      flex: 1;
+      padding: 16px 18px;
+      border-right: 1px solid var(--divider);
+    }
+
+    .state:last-child { border-right: none; }
+
+    .state-name {
+      font-size: 11px;
+      font-weight: 700;
+      margin-bottom: 5px;
+    }
+
+    .state-desc {
+      font-size: 9px;
+      color: var(--text-tertiary);
+      line-height: 1.6;
+    }
+
+    .state-chevron {
+      display: flex;
+      align-items: center;
+      padding: 0 4px;
+      color: var(--text-disabled);
+      font-size: 9px;
+      flex-shrink: 0;
+    }
+
+    /* ── TOOLS GRID ─────────────────────────────── */
+    .tools-grid {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .tool-item {
+      background: var(--surface-1);
+      border: 1px solid var(--divider);
+      border-radius: 6px;
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 10px;
+      min-width: 90px;
+    }
+
+    .tool-label {
+      font-size: 8px;
+      letter-spacing: 0.15em;
+      color: var(--text-tertiary);
+      text-align: center;
+    }
+
+    /* ── FOOTER ─────────────────────────────────── */
+    footer {
+      border-top: 1px solid var(--divider);
+      padding-top: 24px;
+      display: flex;
+      justify-content: space-between;
+    }
+
+    footer span {
+      font-size: 9px;
+      letter-spacing: 0.1em;
+      color: var(--text-disabled);
+    }
+  </style>
+</head>
+<body>
+
+  <!-- ── HEADER ─────────────────────────────────────────────────────── -->
+  <header class="header">
+    <p class="eyebrow">github.com/william-bossut/claude-island · system design</p>
+    <h1>CLAUDE ISLAND</h1>
+    <p class="subhead">Architecture overview — how Claude Code sessions, hooks, and the pill connect</p>
+    <div class="dot-row" id="dot-row"></div>
+  </header>
+
+  <!-- ── 01 FLOW DIAGRAM ───────────────────────────────────────────── -->
+  <section class="section">
+    <p class="section-label">01 — Data flow</p>
+    <div class="flow-wrap">
+      <svg viewBox="0 0 960 230" fill="none" xmlns="http://www.w3.org/2000/svg">
+
+        <!-- ── BOX 1: Claude Code ──────────────── -->
+        <rect x="20" y="20" width="175" height="120" rx="4" fill="#121212" stroke="#2B2B2B"/>
+        <text x="32" y="44" fill="#3D3D3D" font-family="JetBrains Mono" font-size="8" letter-spacing="3">01</text>
+        <text x="32" y="66" fill="#FFFFFF" font-family="JetBrains Mono" font-size="14" font-weight="700">Claude Code</text>
+        <text x="32" y="82" fill="#7A7A7A" font-family="JetBrains Mono" font-size="9">CLI process</text>
+        <line x1="32" y1="94" x2="183" y2="94" stroke="#2B2B2B" stroke-width="1"/>
+        <rect x="32" y="103" width="70" height="16" rx="2" fill="none" stroke="#2B2B2B"/>
+        <text x="42" y="115" fill="#7A7A7A" font-family="JetBrains Mono" font-size="8">PreToolUse</text>
+        <rect x="108" y="103" width="80" height="16" rx="2" fill="none" stroke="#2B2B2B"/>
+        <text x="116" y="115" fill="#7A7A7A" font-family="JetBrains Mono" font-size="8">SessionStart</text>
+
+        <!-- Arrow 1 forward label -->
+        <text x="218" y="55" fill="#3D3D3D" font-family="JetBrains Mono" font-size="8" text-anchor="middle" letter-spacing="1">SPAWN</text>
+        <!-- Arrow 1 forward line -->
+        <line x1="196" y1="80" x2="256" y2="80" stroke="#2B2B2B" stroke-width="1"/>
+        <polygon points="252,75 260,80 252,85" fill="#2B2B2B"/>
+
+        <!-- ── BOX 2: Hook Relay ───────────────── -->
+        <rect x="260" y="20" width="175" height="120" rx="4" fill="#121212" stroke="#2B2B2B"/>
+        <text x="272" y="44" fill="#3D3D3D" font-family="JetBrains Mono" font-size="8" letter-spacing="3">02</text>
+        <text x="272" y="66" fill="#FFFFFF" font-family="JetBrains Mono" font-size="14" font-weight="700">Hook Relay</text>
+        <text x="272" y="82" fill="#7A7A7A" font-family="JetBrains Mono" font-size="9">hook-cli/src/main.rs</text>
+        <line x1="272" y1="94" x2="423" y2="94" stroke="#2B2B2B" stroke-width="1"/>
+        <text x="272" y="110" fill="#3D3D3D" font-family="JetBrains Mono" font-size="9">stdin → enrich → TCP</text>
+        <text x="272" y="126" fill="#3D3D3D" font-family="JetBrains Mono" font-size="9">blocks on PreToolUse</text>
+
+        <!-- Arrow 2 forward label -->
+        <text x="460" y="55" fill="#3D3D3D" font-family="JetBrains Mono" font-size="8" text-anchor="middle" letter-spacing="1">JSON · TCP</text>
+        <!-- Arrow 2 forward line -->
+        <line x1="436" y1="80" x2="496" y2="80" stroke="#2B2B2B" stroke-width="1"/>
+        <polygon points="492,75 500,80 492,85" fill="#2B2B2B"/>
+
+        <!-- ── BOX 3: Bridge Server ────────────── -->
+        <rect x="500" y="20" width="175" height="120" rx="4" fill="#121212" stroke="#2B2B2B"/>
+        <text x="512" y="44" fill="#3D3D3D" font-family="JetBrains Mono" font-size="8" letter-spacing="3">03</text>
+        <text x="512" y="66" fill="#FFFFFF" font-family="JetBrains Mono" font-size="14" font-weight="700">Bridge Server</text>
+        <text x="512" y="82" fill="#7A7A7A" font-family="JetBrains Mono" font-size="9">src-tauri/src/bridge/</text>
+        <line x1="512" y1="94" x2="663" y2="94" stroke="#2B2B2B" stroke-width="1"/>
+        <text x="512" y="110" fill="#3D3D3D" font-family="JetBrains Mono" font-size="9">TCP server · state machine</text>
+        <text x="512" y="126" fill="#3D3D3D" font-family="JetBrains Mono" font-size="9">port file → zero config</text>
+
+        <!-- Arrow 3 forward label -->
+        <text x="700" y="55" fill="#3D3D3D" font-family="JetBrains Mono" font-size="8" text-anchor="middle" letter-spacing="1">EMIT()</text>
+        <!-- Arrow 3 forward line -->
+        <line x1="676" y1="80" x2="736" y2="80" stroke="#2B2B2B" stroke-width="1"/>
+        <polygon points="732,75 740,80 732,85" fill="#2B2B2B"/>
+
+        <!-- ── BOX 4: Pill UI ──────────────────── -->
+        <rect x="740" y="20" width="200" height="120" rx="4" fill="#121212" stroke="#2B2B2B"/>
+        <text x="752" y="44" fill="#3D3D3D" font-family="JetBrains Mono" font-size="8" letter-spacing="3">04</text>
+        <text x="752" y="66" fill="#FFFFFF" font-family="JetBrains Mono" font-size="14" font-weight="700">Pill UI</text>
+        <text x="752" y="82" fill="#7A7A7A" font-family="JetBrains Mono" font-size="9">src/App.svelte · Svelte 5</text>
+        <line x1="752" y1="94" x2="928" y2="94" stroke="#2B2B2B" stroke-width="1"/>
+        <!-- Allow / Deny buttons mock -->
+        <rect x="752" y="102" width="76" height="26" rx="4" fill="#1A1A1A" stroke="#2B2B2B"/>
+        <text x="790" y="119" fill="#BFBFBF" font-family="JetBrains Mono" font-size="10" text-anchor="middle" font-weight="700">Allow</text>
+        <rect x="834" y="102" width="76" height="26" rx="4" fill="#1A1A1A" stroke="#D81F26" stroke-opacity="0.6"/>
+        <text x="872" y="119" fill="#D81F26" font-family="JetBrains Mono" font-size="10" text-anchor="middle" font-weight="700">Deny</text>
+
+        <!-- ── RETURN PATH (permission flow) ───── -->
+        <!-- Down from Pill UI bottom -->
+        <line x1="840" y1="141" x2="840" y2="178" stroke="#2B2B2B" stroke-width="1" stroke-dasharray="5,3"/>
+        <!-- Horizontal return line -->
+        <line x1="108" y1="178" x2="840" y2="178" stroke="#2B2B2B" stroke-width="1" stroke-dasharray="5,3"/>
+        <!-- Up to Claude Code -->
+        <line x1="108" y1="141" x2="108" y2="178" stroke="#2B2B2B" stroke-width="1" stroke-dasharray="5,3"/>
+        <polygon points="103,145 108,137 113,145" fill="#2B2B2B"/>
+
+        <!-- Tick at Bridge Server (resolve_permission) -->
+        <line x1="587" y1="141" x2="587" y2="178" stroke="#2B2B2B" stroke-width="1" stroke-dasharray="5,3"/>
+        <text x="592" y="163" fill="#3D3D3D" font-family="JetBrains Mono" font-size="8">resolve_permission</text>
+
+        <!-- Tick at Hook Relay (TCP directive) -->
+        <line x1="347" y1="141" x2="347" y2="178" stroke="#2B2B2B" stroke-width="1" stroke-dasharray="5,3"/>
+        <text x="230" y="163" fill="#3D3D3D" font-family="JetBrains Mono" font-size="8">TCP directive</text>
+
+        <!-- Return path center label -->
+        <text x="480" y="200" fill="#3D3D3D" font-family="JetBrains Mono" font-size="8" text-anchor="middle" letter-spacing="2">ALLOW / DENY · PERMISSION FLOW</text>
+
+      </svg>
+    </div>
+  </section>
+
+  <!-- ── 02 COMPONENTS ─────────────────────────────────────────────── -->
+  <section class="section">
+    <p class="section-label">02 — Components</p>
+    <div class="cards">
+      <div class="card">
+        <p class="card-num">01 · PROCESS</p>
+        <p class="card-name">Claude Code</p>
+        <p class="card-path">claude-code CLI</p>
+        <div class="card-glyph" id="glyph-play"></div>
+        <ul class="card-list">
+          <li>Fires hooks via <code>~/.claude/settings.json</code> on every session event</li>
+          <li>Spawns hook-cli with event name + JSON payload on stdin</li>
+          <li>Blocks on PreToolUse until hook exits with allow / deny</li>
+          <li>Events: SessionStart · PreToolUse · PostToolUse · Stop</li>
+        </ul>
+      </div>
+      <div class="card">
+        <p class="card-num">02 · BINARY</p>
+        <p class="card-name">Hook Relay</p>
+        <p class="card-path">hook-cli/src/main.rs</p>
+        <div class="card-glyph" id="glyph-bash"></div>
+        <ul class="card-list">
+          <li>Reads event name + JSON payload from stdin</li>
+          <li>Windows: enriches payload with terminal HWND, sets Windows Terminal tab title via OSC-0</li>
+          <li>Connects to TCP bridge, sends BridgeEnvelope as newline-delimited JSON</li>
+          <li>For PreToolUse: blocks — races socket directive vs. console keypresses (y / n)</li>
+        </ul>
+      </div>
+      <div class="card">
+        <p class="card-num">03 · TAURI / RUST</p>
+        <p class="card-name">Bridge Server</p>
+        <p class="card-path">src-tauri/src/bridge/</p>
+        <div class="card-glyph" id="glyph-power"></div>
+        <ul class="card-list">
+          <li>TCP server on Windows · Unix socket on Linux</li>
+          <li>Writes port to <code>%APPDATA%/open-island/port</code> — zero config for hook discovery</li>
+          <li>Session state machine: Idle → Running → Awaiting → Completed</li>
+          <li>Forwards events to frontend via Tauri emit()</li>
+          <li>resolve_permission command → unblocks hook via oneshot channel → directive over TCP</li>
+        </ul>
+      </div>
+      <div class="card">
+        <p class="card-num">04 · SVELTE 5</p>
+        <p class="card-name">Pill UI</p>
+        <p class="card-path">src/App.svelte</p>
+        <div class="card-glyph" id="glyph-read"></div>
+        <ul class="card-list">
+          <li>14px sliver at the top of the screen at rest — expands on hover or urgent session</li>
+          <li>Session list: cwd, phase, tool badge per active Claude Code session</li>
+          <li>Permission panel: Allow / Deny buttons wired to resolve_permission Tauri command</li>
+          <li>Click session row → AttachThreadInput + UIA tab select to focus the right terminal</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── 03 SESSION STATES ──────────────────────────────────────────── -->
+  <section class="section">
+    <p class="section-label">03 — Session lifecycle</p>
+    <div class="states">
+      <div class="state">
+        <p class="state-name">Idle</p>
+        <p class="state-desc">Session registered.<br>No active tool call.</p>
+      </div>
+      <div class="state-chevron">›</div>
+      <div class="state">
+        <p class="state-name">Running</p>
+        <p class="state-desc">Tool executing.<br>No approval needed.</p>
+      </div>
+      <div class="state-chevron">›</div>
+      <div class="state">
+        <p class="state-name" style="color: var(--nothing-red)">Awaiting</p>
+        <p class="state-desc">Hook blocked on<br>PreToolUse. Pill lit.</p>
+      </div>
+      <div class="state-chevron">›</div>
+      <div class="state">
+        <p class="state-name">Running</p>
+        <p class="state-desc">Decision sent.<br>Execution resumes.</p>
+      </div>
+      <div class="state-chevron">›</div>
+      <div class="state">
+        <p class="state-name" style="color: var(--text-tertiary)">Completed</p>
+        <p class="state-desc">Stop event received.<br>Session removed.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── 04 GATED TOOLS ─────────────────────────────────────────────── -->
+  <section class="section">
+    <p class="section-label">04 — Tools requiring approval</p>
+    <div class="tools-grid" id="tools-grid"></div>
+  </section>
+
+  <!-- ── FOOTER ─────────────────────────────────────────────────────── -->
+  <footer>
+    <span>CLAUDE ISLAND · SYSTEM ARCHITECTURE</span>
+    <span>TAURI 2 · SVELTE 5 · RUST · 2026</span>
+  </footer>
+
+  <script>
+    // ── Dot-glyph renderer (matches App.svelte dotGlyph()) ─────────────
+    const GLYPHS = {
+      bash:       "............" + "............" + "..#........." + "..##........" +
+                  "..###......." + "..####......" + "..###......." + "..##........" +
+                  "..#........." + "............" + ".....#####.." + "............",
+      edit:       "............" + "............" + ".........##." + "........###." +
+                  ".......###.." + "......###..." + ".....###...." + "....###....." +
+                  "...###......" + "..###......." + ".##........." + ".#..........",
+      write:      "............" + "..#######..." + "..#.....#..." + "..#.###.#..." +
+                  "..#.....#..." + "..#.###.#..." + "..#.....#..." + "..#.###.#..." +
+                  "..#.....#..." + "..#.....#..." + "..#######..." + "............",
+      multiedit:  "............" + "..######...." + "..#....#...." + "..#.######.." +
+                  "..######.#.." + ".......#.#.." + ".......#.#.." + ".......#.#.." +
+                  ".......#.#.." + ".......#.#.." + ".......###.." + "............",
+      notebook:   "............" + ".##########." + ".##.......#." + ".##.#####.#." +
+                  ".##.......#." + ".##.#####.#." + ".##.......#." + ".##.#####.#." +
+                  ".##.......#." + ".##.#####.#." + ".##########." + "............",
+      webfetch:   "............" + "....####...." + "..##.##.##.." + ".#..#.##..#." +
+                  ".#..#.##..#." + ".########.#." + ".########.#." + ".#..#.##..#." +
+                  ".#..#.##..#." + "..##.##.##.." + "....####...." + "............",
+      websearch:  "............" + "..####......" + ".##..##....." + ".#....#....." +
+                  ".#....#....." + ".#....#....." + ".##..##....." + "..####......" +
+                  "......##...." + ".......##..." + "........##.." + ".........#..",
+      read:       "............" + "............" + "....####...." + "..##....##.." +
+                  ".#..####..#." + ".#.######.#." + ".#.######.#." + ".#..####..#." +
+                  "..##....##.." + "....####...." + "............" + "............",
+      power:      "............" + "......#....." + "......#....." + "...#..#..#.." +
+                  ".##.......##" + ".#.........#" + ".#.........#" + ".#.........#" +
+                  ".##.......##" + "...##...##.." + ".....###...." + "............",
+      play:       "............" + "...##......." + "...####....." + "...######..." +
+                  "...########." + "...#########" + "...#########" + "...########." +
+                  "...######..." + "...####....." + "...##......." + "............",
+    };
+
+    const TOOL_LIST = [
+      { key: "bash",      label: "BASH" },
+      { key: "edit",      label: "EDIT" },
+      { key: "write",     label: "WRITE" },
+      { key: "multiedit", label: "MULTIEDIT" },
+      { key: "notebook",  label: "NOTEBOOK" },
+      { key: "webfetch",  label: "WEB FETCH" },
+      { key: "websearch", label: "WEB SEARCH" },
+      { key: "read",      label: "READ" },
+    ];
+
+    const CARD_GLYPHS = {
+      "glyph-play":  { key: "play",  color: "#3D3D3D" },
+      "glyph-bash":  { key: "bash",  color: "#3D3D3D" },
+      "glyph-power": { key: "power", color: "#3D3D3D" },
+      "glyph-read":  { key: "read",  color: "#3D3D3D" },
+    };
+
+    function renderGlyph(key, cellSize, color) {
+      const src = GLYPHS[key] || "";
+      const gap = 1;
+      const step = cellSize + gap;
+      const cells = [];
+      for (let i = 0; i < 144; i++) {
+        if (src[i] === '#') {
+          const col = i % 12;
+          const row = Math.floor(i / 12);
+          cells.push(
+            `<rect x="${col * step}" y="${row * step}" width="${cellSize}" height="${cellSize}" fill="${color}" rx="0.3"/>`
+          );
+        }
+      }
+      const size = 12 * step - gap;
+      return `<svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}" fill="none">${cells.join('')}</svg>`;
+    }
+
+    // Dot row header
+    const dotRow = document.getElementById('dot-row');
+    for (let i = 0; i < 24; i++) {
+      const d = document.createElement('div');
+      d.className = 'dot';
+      dotRow.appendChild(d);
+    }
+
+    // Card glyphs
+    Object.entries(CARD_GLYPHS).forEach(([id, { key, color }]) => {
+      const el = document.getElementById(id);
+      if (el) el.innerHTML = renderGlyph(key, 2.5, color);
+    });
+
+    // Tools grid
+    const grid = document.getElementById('tools-grid');
+    TOOL_LIST.forEach(({ key, label }) => {
+      const div = document.createElement('div');
+      div.className = 'tool-item';
+      div.innerHTML = renderGlyph(key, 3, '#7A7A7A') +
+        `<span class="tool-label">${label}</span>`;
+      grid.appendChild(div);
+    });
+  </script>
+</body>
+</html>
